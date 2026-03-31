@@ -172,3 +172,23 @@ Each output row contains:
 - `confidence`: `high` or `low`
 - `fallback_recommended`: boolean
 - `fallback_reasons`: list of heuristic trigger labels
+
+## 8) Merge with base ColPali retrieval for low-confidence queries
+
+If you have a base ColPali ranking file (JSONL or TREC run), combine it with concept-overlap results:
+
+```bash
+python scripts/merge_rankings_by_confidence.py \
+  --concept-ranking-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_concept_overlap_rankings_top50_idf_df02_conf_v2.jsonl \
+  --base-ranking /path/to/base_colpali_run.trec \
+  --base-format trec \
+  --output-merged-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_merged_rankings.jsonl \
+  --output-trec-run /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_merged_rankings.trec \
+  --topk-pages 100 \
+  --fallback-on-low-confidence \
+  --fallback-on-flag \
+  --default-source concept \
+  --trec-run-tag splice-merged
+```
+
+The merged output picks concept-overlap rankings for high-confidence queries and falls back to base rankings for low-confidence queries when available.

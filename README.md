@@ -41,6 +41,7 @@ If you already have precomputed page/query embeddings (e.g., from ColPali), use:
 - `scripts/inspect_embedding_store.py` to inspect embedding file shapes/keys and metadata (including `.safetensors` stores).
 - `scripts/build_concept_vocab_from_queries.py` + `scripts/concepts_to_queries_jsonl.py` + `scripts/build_dictionary_from_concept_embeddings.py` to create `colpali_concepts.txt` and `colpali_concept_dictionary.pt`.
 - `scripts/concept_overlap_retrieval.py` to score and rank pages per query from concept-overlap weights.
+- `scripts/merge_rankings_by_confidence.py` to combine concept-overlap rankings with base retriever rankings using confidence/fallback flags.
 
 See `HPC_WORKFLOW.md` for concrete commands and expected input/output formats.
 
