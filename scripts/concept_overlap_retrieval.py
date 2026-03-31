@@ -18,6 +18,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk-pages", type=int, default=50, help="Number of top pages to keep per query.")
     parser.add_argument("--max-shared-concepts", type=int, default=5, help="Max shared concepts to emit per query-page pair.")
     parser.add_argument("--min-score", type=float, default=0.0, help="Drop query-page matches below this overlap score.")
+    parser.add_argument("--min-shared-concepts", type=int, default=1, help="Require at least this many shared concepts for a query-page match.")
+    parser.add_argument("--must-match-top-query-concepts", type=int, default=0, help="If >0, require at least one shared concept from the top-N query concepts.")
     parser.add_argument("--idf-weighting", action="store_true", help="Apply IDF weighting per concept during overlap scoring.")
     parser.add_argument("--idf-power", type=float, default=1.0, help="Power applied to IDF multiplier (1.0 = linear).")
     parser.add_argument("--max-pages-per-concept", type=int, default=0, help="If >0, keep only the top-N pages per concept by concept weight.")
@@ -149,16 +151,35 @@ def main() -> None:
         for q_idx, query_id in enumerate(query_ids):
             q_concepts = query_concepts[q_idx]
             score_by_page: Dict[int, float] = defaultdict(float)
+            shared_by_page: Dict[int, set] = defaultdict(set)
+
+            top_query_concepts: set = set()
+            if args.must_match_top_query_concepts > 0:
+                top_query_concepts = {
+                    str(item.get("concept", "")).strip()
+                    for item in query_raw_top[q_idx][: args.must_match_top_query_concepts]
+                    if str(item.get("concept", "")).strip()
+                }
 
             for concept, q_weight in q_concepts.items():
                 idf_scale = idf_weights.get(concept, 1.0) ** args.idf_power if args.idf_weighting else 1.0
                 for page_idx, p_weight in postings.get(concept, []):
-                    score_by_page[page_idx] += q_weight * p_weight * idf_scale
+                    contribution = q_weight * p_weight * idf_scale
+                    if contribution <= 0:
+                        continue
+                    score_by_page[page_idx] += contribution
+                    shared_by_page[page_idx].add(concept)
 
-            if args.min_score > 0:
-                candidates = [(pidx, score) for pidx, score in score_by_page.items() if score >= args.min_score]
-            else:
-                candidates = list(score_by_page.items())
+            candidates = []
+            for pidx, score in score_by_page.items():
+                if score < args.min_score:
+                    continue
+                shared = shared_by_page.get(pidx, set())
+                if len(shared) < args.min_shared_concepts:
+                    continue
+                if top_query_concepts and not (shared & top_query_concepts):
+                    continue
+                candidates.append((pidx, score))
 
             top_pairs = heapq.nlargest(args.topk_pages, candidates, key=lambda x: x[1])
             top_pages = []
