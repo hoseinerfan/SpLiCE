@@ -7,6 +7,7 @@ Codebase for the paper
 ## Table of Contents
  * [Approach](#approach)
  * [Installation](#installation)
+ * [HPC Workflow (Precomputed Embeddings)](#hpc-workflow-precomputed-embeddings)
  * [Examples](#examples)
      * [Sample Concept Decomposition](#sample-concept-decomposition)
      * [Class/Dataset Concept Distributions](#classdataset-concept-distributions)
@@ -30,6 +31,15 @@ git clone git@github.com:AI4LIFE-GROUP/SpLiCE.git
 cd SpLiCE
 pip install .
 ```
+
+## HPC Workflow (Precomputed Embeddings)
+
+If you already have precomputed page/query embeddings (e.g., from ColPali), use:
+
+- `scripts/label_precomputed_embeddings.py` to produce concept labels for embeddings on disk.
+- `scripts/filter_mmqa_queries.py` to extract/filter query text records from MMQA JSONL.
+
+See `HPC_WORKFLOW.md` for concrete commands and expected input/output formats.
 
 
 ## Examples
