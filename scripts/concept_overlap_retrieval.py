@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence-top-pages-window", type=int, default=10, help="How many top-ranked pages to inspect for confidence flags.")
     parser.add_argument("--confidence-max-anchor-concepts", type=int, default=3, help="Number of anchor query concepts used for confidence checks.")
     parser.add_argument("--confidence-anchor-min-weight", type=float, default=0.05, help="Minimum query concept weight to be considered an anchor.")
+    parser.add_argument("--confidence-anchor-score", type=str, default="query_weight", choices=["query_weight", "query_weight_idf"], help="How to rank confidence anchor concepts.")
     parser.add_argument("--confidence-min-anchor-page-hits", type=int, default=2, help="Minimum pages in top window that should match at least one anchor concept.")
     parser.add_argument("--confidence-require-first-anchor-hit", action="store_true", help="Require the strongest anchor concept to appear at least once in the top window.")
     parser.add_argument("--confidence-max-top1-dominance", type=float, default=0.95, help="Mark low confidence if top1 is overly dominated by a single concept.")
@@ -151,6 +152,7 @@ def select_anchor_concepts(
     idf_weights: Dict[str, float],
     max_anchor_concepts: int,
     anchor_min_weight: float,
+    anchor_score_mode: str,
 ) -> List[Tuple[str, float, float, float]]:
     # Returns tuples: (concept, query_weight, idf, anchor_score)
     anchors: List[Tuple[str, float, float, float]] = []
@@ -162,7 +164,10 @@ def select_anchor_concepts(
         if query_weight < anchor_min_weight:
             continue
         idf = float(idf_weights.get(concept, 1.0))
-        anchor_score = query_weight * idf
+        if anchor_score_mode == "query_weight_idf":
+            anchor_score = query_weight * idf
+        else:
+            anchor_score = query_weight
         anchors.append((concept, query_weight, idf, anchor_score))
 
     anchors.sort(key=lambda x: x[3], reverse=True)
@@ -180,6 +185,7 @@ def compute_confidence_flags(
         idf_weights=idf_weights,
         max_anchor_concepts=args.confidence_max_anchor_concepts,
         anchor_min_weight=args.confidence_anchor_min_weight,
+        anchor_score_mode=args.confidence_anchor_score,
     )
 
     window = top_pages[: args.confidence_top_pages_window]
@@ -233,6 +239,7 @@ def compute_confidence_flags(
 
     details = {
         "top_pages_window": args.confidence_top_pages_window,
+        "anchor_score_mode": args.confidence_anchor_score,
         "anchor_page_hits": anchor_page_hits,
         "anchors": [
             {
