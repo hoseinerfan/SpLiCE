@@ -3,7 +3,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List
 
 
 STOPWORDS = {
@@ -64,6 +64,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--backfill-max-concepts", type=int, default=5)
     parser.add_argument("--backfill-use-bigrams", action="store_true")
+    parser.add_argument(
+        "--min-concepts",
+        type=int,
+        default=0,
+        help="Ensure at least this many concepts by lexical token backfill (0 disables).",
+    )
+    parser.add_argument(
+        "--min-concepts-long-query-tokens",
+        type=int,
+        default=0,
+        help="Apply --min-concepts only when query token count >= this threshold (0 applies to all queries).",
+    )
     parser.add_argument("--min-token-len", type=int, default=3)
     parser.add_argument("--keep-stopwords", action="store_true")
     return parser.parse_args()
@@ -179,6 +191,39 @@ def build_backfill_concepts(
     return [{"concept": c, "weight": w} for c in candidates]
 
 
+def augment_to_min_concepts(
+    current: List[Dict],
+    query_text: str,
+    target: int,
+    use_bigrams: bool,
+    min_token_len: int,
+    keep_stopwords: bool,
+    candidate_max: int,
+) -> List[Dict]:
+    if target <= 0 or len(current) >= target:
+        return current
+
+    pool = build_backfill_concepts(
+        query_text=query_text,
+        max_concepts=candidate_max,
+        use_bigrams=use_bigrams,
+        min_token_len=min_token_len,
+        keep_stopwords=keep_stopwords,
+    )
+
+    existing = {normalize_text(c["concept"]) for c in current if normalize_text(c["concept"])}
+    out = list(current)
+    for cand in pool:
+        c_norm = normalize_text(cand["concept"])
+        if not c_norm or c_norm in existing:
+            continue
+        out.append({"concept": cand["concept"], "weight": cand["weight"]})
+        existing.add(c_norm)
+        if len(out) >= target:
+            break
+    return out
+
+
 def main() -> None:
     args = parse_args()
 
@@ -213,6 +258,7 @@ def main() -> None:
     n = 0
     with_lexical = 0
     with_backfill = 0
+    with_min_concepts_augment = 0
     zero_before_backfill = 0
     zero_after_backfill = 0
     avg_kept = 0.0
@@ -250,6 +296,7 @@ def main() -> None:
                     )
 
             backfilled = False
+            min_augmented = False
             final_concepts = lexical_kept
             if not final_concepts and args.backfill_missing:
                 final_concepts = build_backfill_concepts(
@@ -262,6 +309,28 @@ def main() -> None:
                 backfilled = bool(final_concepts)
                 if backfilled:
                     with_backfill += 1
+
+            if args.min_concepts > 0:
+                token_count = len(tokenize(query_text))
+                apply_min = (
+                    args.min_concepts_long_query_tokens <= 0
+                    or token_count >= args.min_concepts_long_query_tokens
+                )
+                if apply_min and len(final_concepts) < args.min_concepts:
+                    before = len(final_concepts)
+                    candidate_max = max(args.min_concepts * 3, args.backfill_max_concepts, 10)
+                    final_concepts = augment_to_min_concepts(
+                        current=final_concepts,
+                        query_text=query_text,
+                        target=args.min_concepts,
+                        use_bigrams=args.backfill_use_bigrams,
+                        min_token_len=args.min_token_len,
+                        keep_stopwords=args.keep_stopwords,
+                        candidate_max=candidate_max,
+                    )
+                    min_augmented = len(final_concepts) > before
+                    if min_augmented:
+                        with_min_concepts_augment += 1
 
             if not final_concepts:
                 zero_after_backfill += 1
@@ -278,6 +347,7 @@ def main() -> None:
                 "original_concepts": len(original_concepts),
                 "lexical_kept": len(lexical_kept),
                 "backfilled": backfilled,
+                "min_concepts_augmented": min_augmented,
             }
             out_handle.write(json.dumps(out_row) + "\n")
 
@@ -290,6 +360,11 @@ def main() -> None:
     print(f"Queries zero before backfill: {zero_before_backfill} ratio={zero_before_backfill / max(n, 1):.3f}")
     if args.backfill_missing:
         print(f"Queries backfilled: {with_backfill} ratio={with_backfill / max(n, 1):.3f}")
+    if args.min_concepts > 0:
+        print(
+            f"Queries min-concepts augmented: {with_min_concepts_augment} "
+            f"ratio={with_min_concepts_augment / max(n, 1):.3f}"
+        )
     print(f"Queries zero after backfill: {zero_after_backfill} ratio={zero_after_backfill / max(n, 1):.3f}")
     print(f"Average kept concepts: {avg_kept / max(n, 1):.3f}")
 

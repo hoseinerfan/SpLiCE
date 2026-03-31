@@ -233,6 +233,19 @@ This outputs:
 - optional report of zero-lexical queries
 - optional backfill concepts from query tokens/bigrams for empty cases
 
+For long-query robustness, you can also enforce a minimum number of lexical concepts:
+
+```bash
+python scripts/postprocess_query_concepts_lexical.py \
+  --queries-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/multimodalqa/MMQA_dev_queries_filtered.jsonl \
+  --labels-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_query_labels_top50.jsonl \
+  --output-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_query_labels_lexical_longquery.jsonl \
+  --backfill-missing \
+  --backfill-max-concepts 5 \
+  --min-concepts 4 \
+  --min-concepts-long-query-tokens 10
+```
+
 ## 11) Audit concept health on a query subset
 
 For a quick sanity check of concept quality on sampled queries:
