@@ -212,3 +212,23 @@ This writes:
 - sampled query IDs: `sampled_qids.txt`
 - filtered qrels and runs for exactly those queries
 - metric table for each run
+
+## 10) Token-faithful query concepts (no retrieval step)
+
+If your goal is to keep only concepts that directly match query text, run lexical post-processing:
+
+```bash
+python scripts/postprocess_query_concepts_lexical.py \
+  --queries-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/multimodalqa/MMQA_dev_queries_filtered.jsonl \
+  --labels-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_query_labels_top50.jsonl \
+  --output-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_query_labels_lexical.jsonl \
+  --zero-output-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_query_labels_zero_lexical.jsonl \
+  --backfill-missing \
+  --backfill-max-concepts 5 \
+  --backfill-use-bigrams
+```
+
+This outputs:
+- lexical-only concepts per query
+- optional report of zero-lexical queries
+- optional backfill concepts from query tokens/bigrams for empty cases
