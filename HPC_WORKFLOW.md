@@ -192,3 +192,23 @@ python scripts/merge_rankings_by_confidence.py \
 ```
 
 The merged output picks concept-overlap rankings for high-confidence queries and falls back to base rankings for low-confidence queries when available.
+
+## 9) Quick 20-query IR check (baseline vs merged)
+
+Use this to sanity-check performance on a small random subset before full evaluation.
+
+```bash
+python scripts/eval_trec_subset.py \
+  --qrels /mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/multimodalqa/MMQA_dev_qrels.trec \
+  --run baseline=/mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_base_colpali.trec \
+  --run merged=/mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_merged_rankings.trec \
+  --sample-size 20 \
+  --seed 42 \
+  --metrics map,recip_rank,ndcg_cut.10 \
+  --output-dir /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/eval_subset_20
+```
+
+This writes:
+- sampled query IDs: `sampled_qids.txt`
+- filtered qrels and runs for exactly those queries
+- metric table for each run
