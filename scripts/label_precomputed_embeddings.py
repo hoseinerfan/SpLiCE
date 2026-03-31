@@ -16,12 +16,17 @@ try:
 except ImportError:  # Optional dependency for .npy input.
     np = None
 
+try:
+    from safetensors.torch import load_file as load_safetensors_file
+except ImportError:  # Optional dependency for .safetensors input.
+    load_safetensors_file = None
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Label precomputed embeddings with sparse concept decompositions."
     )
-    parser.add_argument("--embeddings-path", type=str, required=True, help="Path to a .pt/.pth/.npy file or a directory containing them.")
+    parser.add_argument("--embeddings-path", type=str, required=True, help="Path to a .pt/.pth/.npy/.safetensors file or a directory containing them.")
     parser.add_argument("--dictionary-path", type=str, required=True, help="Path to concept dictionary tensor with shape [num_concepts, dim].")
     parser.add_argument("--vocab-path", type=str, required=True, help="Path to vocab text file, one concept per line.")
     parser.add_argument("--output-jsonl", type=str, required=True, help="Destination JSONL file.")
@@ -64,6 +69,10 @@ def load_object(path: Path) -> Any:
         if np is None:
             raise ImportError("numpy is required to load .npy files.")
         return np.load(path, allow_pickle=True)
+    if suffix == ".safetensors":
+        if load_safetensors_file is None:
+            raise ImportError("safetensors is required to load .safetensors files. Install with: pip install safetensors")
+        return load_safetensors_file(str(path), device="cpu")
     raise ValueError(f"Unsupported file suffix: {path}")
 
 
@@ -73,7 +82,7 @@ def list_embedding_files(path: Path, recursive: bool) -> List[Path]:
     if not path.is_dir():
         raise FileNotFoundError(f"Embedding path not found: {path}")
 
-    valid_suffixes = {".pt", ".pth", ".npy"}
+    valid_suffixes = {".pt", ".pth", ".npy", ".safetensors"}
     files: List[Path] = []
     if recursive:
         for root, _, filenames in os.walk(path):
@@ -149,12 +158,19 @@ def parse_embedding_object(
             yield from _yield_from_tensor(to_tensor(obj["embeddings"]), base_id, layout, ids)
             return
 
-        emitted = False
+        tensor_items: List[Tuple[str, torch.Tensor]] = []
         for key, value in obj.items():
             if isinstance(value, torch.Tensor) or (np is not None and isinstance(value, np.ndarray)):
-                emitted = True
-                yield str(key), _pool_to_vector(to_tensor(value))
-        if emitted:
+                tensor_items.append((str(key), to_tensor(value)))
+
+        if tensor_items:
+            ids = _extract_ids(obj)
+            if len(tensor_items) == 1:
+                _, tensor = tensor_items[0]
+                yield from _yield_from_tensor(tensor, base_id, layout, ids)
+            else:
+                for key, tensor in tensor_items:
+                    yield from _yield_from_tensor(tensor, f"{base_id}:{key}", layout, ids=None)
             return
 
         raise TypeError(f"Could not parse dict embeddings for: {base_id}. Keys={list(obj.keys())[:10]}")

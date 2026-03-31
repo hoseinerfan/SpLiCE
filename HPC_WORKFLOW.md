@@ -10,6 +10,14 @@ cd SpLiCE
 pip install -e .
 ```
 
+Optional sanity check for embedding stores:
+
+```bash
+python scripts/inspect_embedding_store.py \
+  --embeddings-path /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev \
+  --sample-files 10
+```
+
 ## 2) Prepare MMQA queries for runtime embedding
 
 Extract query IDs/text from your MMQA dev file:
@@ -48,6 +56,7 @@ Important:
 - `--vocab-path` must have one concept string per line with exactly `num_concepts` lines.
 - Embedding dimension must match the dictionary dimension.
 - If `--mean-path` is omitted, the script estimates mean from your embeddings.
+- `.safetensors` embeddings are supported directly.
 
 ## 4) Label query embeddings generated at runtime
 
@@ -72,4 +81,3 @@ Each line in output JSONL contains:
 - `top_concepts` (list of `{concept, weight}`)
 - `l0_norm`
 - `cosine_similarity`
-

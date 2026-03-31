@@ -38,6 +38,7 @@ If you already have precomputed page/query embeddings (e.g., from ColPali), use:
 
 - `scripts/label_precomputed_embeddings.py` to produce concept labels for embeddings on disk.
 - `scripts/filter_mmqa_queries.py` to extract/filter query text records from MMQA JSONL.
+- `scripts/inspect_embedding_store.py` to inspect embedding file shapes/keys and metadata (including `.safetensors` stores).
 
 See `HPC_WORKFLOW.md` for concrete commands and expected input/output formats.
 
