@@ -77,6 +77,17 @@ def parse_args() -> argparse.Namespace:
         help="Apply --min-concepts only when query token count >= this threshold (0 applies to all queries).",
     )
     parser.add_argument("--min-token-len", type=int, default=3)
+    parser.add_argument(
+        "--drop-generic-concepts",
+        action="store_true",
+        help="Drop lexical concepts that are stopword-only or too short/generic.",
+    )
+    parser.add_argument(
+        "--generic-min-token-len",
+        type=int,
+        default=3,
+        help="Minimum token length used by generic-concept filter.",
+    )
     parser.add_argument("--keep-stopwords", action="store_true")
     return parser.parse_args()
 
@@ -116,6 +127,18 @@ def normalize_weights(items: List[Dict]) -> List[Dict]:
         uniform = 1.0 / len(items)
         return [{"concept": x["concept"], "weight": uniform} for x in items]
     return [{"concept": x["concept"], "weight": max(float(x["weight"]), 0.0) / total} for x in items]
+
+
+def is_generic_concept(concept: str, min_token_len: int) -> bool:
+    toks = tokenize(concept)
+    if not toks:
+        return True
+    meaningful = [t for t in toks if t not in STOPWORDS]
+    if not meaningful:
+        return True
+    if all(len(t) < min_token_len for t in meaningful):
+        return True
+    return False
 
 
 def parse_concept_items(row: Dict, concept_field: str) -> List[Dict]:
@@ -259,6 +282,7 @@ def main() -> None:
     with_lexical = 0
     with_backfill = 0
     with_min_concepts_augment = 0
+    generic_filtered = 0
     zero_before_backfill = 0
     zero_after_backfill = 0
     avg_kept = 0.0
@@ -277,6 +301,14 @@ def main() -> None:
 
             original_concepts = parse_concept_items(row, concept_field)
             lexical_kept = lexical_filter(query_norm, original_concepts)
+            if args.drop_generic_concepts:
+                before = len(lexical_kept)
+                lexical_kept = [
+                    c
+                    for c in lexical_kept
+                    if not is_generic_concept(c["concept"], args.generic_min_token_len)
+                ]
+                generic_filtered += max(before - len(lexical_kept), 0)
             had_lexical = bool(lexical_kept)
 
             if had_lexical:
@@ -365,6 +397,8 @@ def main() -> None:
             f"Queries min-concepts augmented: {with_min_concepts_augment} "
             f"ratio={with_min_concepts_augment / max(n, 1):.3f}"
         )
+    if args.drop_generic_concepts:
+        print(f"Generic lexical concepts filtered: {generic_filtered}")
     print(f"Queries zero after backfill: {zero_after_backfill} ratio={zero_after_backfill / max(n, 1):.3f}")
     print(f"Average kept concepts: {avg_kept / max(n, 1):.3f}")
 

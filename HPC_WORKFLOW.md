@@ -242,6 +242,7 @@ python scripts/postprocess_query_concepts_lexical.py \
   --output-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_query_labels_lexical_longquery.jsonl \
   --backfill-missing \
   --backfill-max-concepts 5 \
+  --drop-generic-concepts \
   --min-concepts 4 \
   --min-concepts-long-query-tokens 10
 ```
