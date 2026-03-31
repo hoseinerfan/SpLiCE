@@ -61,9 +61,21 @@ python scripts/concepts_to_queries_jsonl.py \
 
 ### 3c) Run your existing ColPali query-embedding job on concept queries
 
-Use your runtime embedding pipeline to embed:
-- Input: `colpali_concept_queries.jsonl`
-- Output directory: `/mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concept_query_embeddings`
+Use either your existing runtime embedding pipeline, or the helper script:
+
+```bash
+python scripts/embed_colpali_queries.py \
+  --input-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concept_queries.jsonl \
+  --output-dir /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concept_query_embeddings \
+  --model-name vidore/colpali-v1.2 \
+  --backend auto \
+  --query-id-field query_id \
+  --query-text-field query_text \
+  --batch-size 64 \
+  --dtype bfloat16 \
+  --device cuda:0 \
+  --skip-existing
+```
 
 Expected output:
 - one embedding file per concept query ID (same ID from JSONL), `.safetensors`/`.pt`/`.npy`
