@@ -232,3 +232,25 @@ This outputs:
 - lexical-only concepts per query
 - optional report of zero-lexical queries
 - optional backfill concepts from query tokens/bigrams for empty cases
+
+## 11) Audit concept health on a query subset
+
+For a quick sanity check of concept quality on sampled queries:
+
+```bash
+python scripts/audit_query_concept_health.py \
+  --queries-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/multimodalqa/MMQA_dev_queries_filtered.jsonl \
+  --labels-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_query_labels_lexical_backfilled_unigram.jsonl \
+  --sample-size 100 \
+  --seed 42 \
+  --show-examples 8 \
+  --output-sample-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_query_concept_health_sample.jsonl \
+  --output-summary-json /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_query_concept_health_summary.json
+```
+
+This reports:
+- zero-concept rate
+- lexical match rate
+- top-1 dominance rate
+- generic/non-lexical concept rates
+- flagged and healthy examples
