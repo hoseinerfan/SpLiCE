@@ -24,6 +24,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--idf-power", type=float, default=1.0, help="Power applied to IDF multiplier (1.0 = linear).")
     parser.add_argument("--max-concept-df-ratio", type=float, default=1.0, help="Drop concepts that appear in more than this fraction of pages (e.g., 0.05).")
     parser.add_argument("--max-pages-per-concept", type=int, default=0, help="If >0, keep only the top-N pages per concept by concept weight.")
+    parser.add_argument("--confidence-top-pages-window", type=int, default=10, help="How many top-ranked pages to inspect for confidence flags.")
+    parser.add_argument("--confidence-max-anchor-concepts", type=int, default=3, help="Number of anchor query concepts used for confidence checks.")
+    parser.add_argument("--confidence-anchor-min-weight", type=float, default=0.05, help="Minimum query concept weight to be considered an anchor.")
+    parser.add_argument("--confidence-min-anchor-page-hits", type=int, default=2, help="Minimum pages in top window that should match at least one anchor concept.")
+    parser.add_argument("--confidence-require-first-anchor-hit", action="store_true", help="Require the strongest anchor concept to appear at least once in the top window.")
+    parser.add_argument("--confidence-max-top1-dominance", type=float, default=0.95, help="Mark low confidence if top1 is overly dominated by a single concept.")
+    parser.add_argument("--confidence-top1-max-shared-concepts", type=int, default=1, help="Used with top1 dominance rule; triggers low confidence when top1 shared concepts <= this value.")
     parser.add_argument("--include-page-top-concepts", action="store_true", help="Include page top concepts in output rows.")
     parser.add_argument("--progress-every", type=int, default=200, help="Print progress every N queries.")
     return parser.parse_args()
@@ -139,6 +146,109 @@ def get_shared_concepts(
     ]
 
 
+def select_anchor_concepts(
+    query_top_concepts: List[Dict[str, float]],
+    idf_weights: Dict[str, float],
+    max_anchor_concepts: int,
+    anchor_min_weight: float,
+) -> List[Tuple[str, float, float, float]]:
+    # Returns tuples: (concept, query_weight, idf, anchor_score)
+    anchors: List[Tuple[str, float, float, float]] = []
+    for item in query_top_concepts:
+        concept = str(item.get("concept", "")).strip()
+        if not concept:
+            continue
+        query_weight = float(item.get("weight", 0.0))
+        if query_weight < anchor_min_weight:
+            continue
+        idf = float(idf_weights.get(concept, 1.0))
+        anchor_score = query_weight * idf
+        anchors.append((concept, query_weight, idf, anchor_score))
+
+    anchors.sort(key=lambda x: x[3], reverse=True)
+    return anchors[:max_anchor_concepts]
+
+
+def compute_confidence_flags(
+    query_top_concepts: List[Dict[str, float]],
+    top_pages: List[Dict[str, object]],
+    idf_weights: Dict[str, float],
+    args: argparse.Namespace,
+) -> Tuple[str, bool, List[str], Dict[str, object]]:
+    anchors = select_anchor_concepts(
+        query_top_concepts=query_top_concepts,
+        idf_weights=idf_weights,
+        max_anchor_concepts=args.confidence_max_anchor_concepts,
+        anchor_min_weight=args.confidence_anchor_min_weight,
+    )
+
+    window = top_pages[: args.confidence_top_pages_window]
+    anchor_set = {a[0] for a in anchors}
+    anchor_hits_by_concept: Dict[str, int] = {a[0]: 0 for a in anchors}
+    anchor_page_hits = 0
+
+    for page in window:
+        shared = page.get("shared_concepts", [])
+        if not isinstance(shared, list):
+            continue
+        page_shared = {str(s.get("concept", "")).strip() for s in shared if str(s.get("concept", "")).strip()}
+        matched = anchor_set & page_shared
+        if matched:
+            anchor_page_hits += 1
+            for concept in matched:
+                anchor_hits_by_concept[concept] += 1
+
+    reasons: List[str] = []
+    if not top_pages:
+        reasons.append("no_top_pages")
+    if not anchors:
+        reasons.append("no_anchor_concepts")
+    else:
+        first_anchor = anchors[0][0]
+        first_anchor_hits = anchor_hits_by_concept.get(first_anchor, 0)
+        if args.confidence_require_first_anchor_hit and first_anchor_hits == 0:
+            reasons.append("first_anchor_missing")
+        if anchor_page_hits < args.confidence_min_anchor_page_hits:
+            reasons.append("low_anchor_page_hits")
+
+    if top_pages:
+        top1 = top_pages[0]
+        shared_top1 = top1.get("shared_concepts", [])
+        if not isinstance(shared_top1, list):
+            shared_top1 = []
+        top1_score = float(top1.get("score", 0.0))
+        top1_dom = 1.0
+        if top1_score > 0 and shared_top1:
+            top1_dom = float(shared_top1[0].get("overlap", 0.0)) / top1_score
+        if (
+            top1_dom >= args.confidence_max_top1_dominance
+            and len(shared_top1) <= args.confidence_top1_max_shared_concepts
+        ):
+            reasons.append("top1_single_concept_dominance")
+    else:
+        top1_dom = 1.0
+
+    fallback_recommended = len(reasons) > 0
+    confidence = "low" if fallback_recommended else "high"
+
+    details = {
+        "top_pages_window": args.confidence_top_pages_window,
+        "anchor_page_hits": anchor_page_hits,
+        "anchors": [
+            {
+                "concept": concept,
+                "query_weight": round(float(qw), 6),
+                "idf": round(float(idf), 6),
+                "anchor_score": round(float(anchor_score), 6),
+                "hits_in_top_window": int(anchor_hits_by_concept.get(concept, 0)),
+            }
+            for concept, qw, idf, anchor_score in anchors
+        ],
+        "top1_dominance": round(float(top1_dom), 6),
+    }
+    return confidence, fallback_recommended, reasons, details
+
+
 def main() -> None:
     args = parse_args()
 
@@ -229,10 +339,21 @@ def main() -> None:
                     item["page_top_concepts"] = page_raw_top[page_idx]
                 top_pages.append(item)
 
+            confidence, fallback_recommended, fallback_reasons, confidence_details = compute_confidence_flags(
+                query_top_concepts=query_raw_top[q_idx],
+                top_pages=top_pages,
+                idf_weights=idf_weights,
+                args=args,
+            )
+
             row = {
                 "query_id": query_id,
                 "query_top_concepts": query_raw_top[q_idx],
                 "top_pages": top_pages,
+                "confidence": confidence,
+                "fallback_recommended": fallback_recommended,
+                "fallback_reasons": fallback_reasons,
+                "confidence_details": confidence_details,
             }
             out_handle.write(json.dumps(row) + "\n")
 

@@ -169,3 +169,6 @@ Each output row contains:
 - `query_id`
 - `query_top_concepts`
 - `top_pages`: list of `{page_id, score, shared_concepts}`
+- `confidence`: `high` or `low`
+- `fallback_recommended`: boolean
+- `fallback_reasons`: list of heuristic trigger labels
