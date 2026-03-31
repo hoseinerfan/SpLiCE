@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--must-match-top-query-concepts", type=int, default=0, help="If >0, require at least one shared concept from the top-N query concepts.")
     parser.add_argument("--idf-weighting", action="store_true", help="Apply IDF weighting per concept during overlap scoring.")
     parser.add_argument("--idf-power", type=float, default=1.0, help="Power applied to IDF multiplier (1.0 = linear).")
+    parser.add_argument("--max-concept-df-ratio", type=float, default=1.0, help="Drop concepts that appear in more than this fraction of pages (e.g., 0.05).")
     parser.add_argument("--max-pages-per-concept", type=int, default=0, help="If >0, keep only the top-N pages per concept by concept weight.")
     parser.add_argument("--include-page-top-concepts", action="store_true", help="Include page top concepts in output rows.")
     parser.add_argument("--progress-every", type=int, default=200, help="Print progress every N queries.")
@@ -74,17 +75,35 @@ def load_label_jsonl(path: str) -> Tuple[List[str], List[Dict[str, float]], List
 def build_page_inverted_index(
     page_ids: List[str],
     page_concept_dicts: List[Dict[str, float]],
-    max_pages_per_concept: int = 0,
 ) -> Dict[str, List[Tuple[int, float]]]:
     postings: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
     for page_idx, concept_weights in enumerate(page_concept_dicts):
         for concept, weight in concept_weights.items():
             postings[concept].append((page_idx, weight))
-
-    if max_pages_per_concept > 0:
-        for concept in postings.keys():
-            postings[concept] = sorted(postings[concept], key=lambda x: x[1], reverse=True)[:max_pages_per_concept]
     return postings
+
+
+def apply_postings_filters(
+    postings: Dict[str, List[Tuple[int, float]]],
+    num_pages: int,
+    max_concept_df_ratio: float,
+    max_pages_per_concept: int,
+) -> Tuple[Dict[str, List[Tuple[int, float]]], int]:
+    filtered: Dict[str, List[Tuple[int, float]]] = {}
+    dropped_df = 0
+
+    for concept, posting_list in postings.items():
+        df_ratio = len(posting_list) / max(num_pages, 1)
+        if df_ratio > max_concept_df_ratio:
+            dropped_df += 1
+            continue
+
+        if max_pages_per_concept > 0:
+            posting_list = sorted(posting_list, key=lambda x: x[1], reverse=True)[:max_pages_per_concept]
+
+        filtered[concept] = posting_list
+
+    return filtered, dropped_df
 
 
 def compute_idf_weights(
@@ -130,15 +149,25 @@ def main() -> None:
         raise ValueError(f"No query labels found: {args.query_labels_jsonl}")
     if not page_ids:
         raise ValueError(f"No page labels found: {args.page_labels_jsonl}")
+    if args.max_concept_df_ratio <= 0 or args.max_concept_df_ratio > 1.0:
+        raise ValueError("--max-concept-df-ratio must be in (0, 1].")
 
-    postings = build_page_inverted_index(
+    raw_postings = build_page_inverted_index(
         page_ids,
         page_concepts,
+    )
+    postings, dropped_df = apply_postings_filters(
+        raw_postings,
+        num_pages=len(page_ids),
+        max_concept_df_ratio=args.max_concept_df_ratio,
         max_pages_per_concept=args.max_pages_per_concept,
     )
     idf_weights = compute_idf_weights(postings, num_pages=len(page_ids))
     print(f"Loaded {len(query_ids)} queries and {len(page_ids)} pages.")
-    print(f"Built inverted index over {len(postings)} unique concepts.")
+    print(f"Built inverted index over {len(raw_postings)} unique concepts.")
+    if dropped_df > 0:
+        print(f"Dropped {dropped_df} concepts by df ratio > {args.max_concept_df_ratio}.")
+    print(f"Scoring with {len(postings)} concepts after filters.")
     if args.idf_weighting:
         print(f"IDF weighting enabled (power={args.idf_power}).")
     if args.max_pages_per_concept > 0:
