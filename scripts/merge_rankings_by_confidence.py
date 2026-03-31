@@ -151,6 +151,20 @@ def to_trec_lines(query_id: str, pages: List[Dict], run_tag: str) -> Iterable[st
 def main() -> None:
     args = parse_args()
 
+    base_path = Path(args.base_ranking)
+    if not base_path.exists():
+        hint = ""
+        if args.base_ranking.startswith("/path/to/"):
+            hint = (
+                " It looks like you used the placeholder path from the docs. "
+                "Replace --base-ranking with your real JSONL/TREC file."
+            )
+        raise FileNotFoundError(
+            f"Base ranking file not found: {args.base_ranking}.{hint} "
+            "You can locate candidates with: find /mmfs1/scratch -type f "
+            "\\( -name '*.trec' -o -name '*.run' -o -name '*.jsonl' \\) | grep -i -E 'colpali|base|ranking|run'"
+        )
+
     base_format = args.base_format
     if base_format == "auto":
         base_format = detect_base_format(args.base_ranking)
