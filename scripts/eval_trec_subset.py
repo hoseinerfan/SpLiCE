@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,7 +93,7 @@ def sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
 
 
-def run_trec_eval(
+def run_trec_eval_binary(
     trec_eval_bin: str,
     metrics: List[str],
     qrels_path: Path,
@@ -127,13 +127,98 @@ def run_trec_eval(
     return values
 
 
+def _to_pytrec_metric(metric: str) -> str:
+    metric = metric.strip()
+    match = re.match(r"^([A-Za-z0-9_]+)\.(\d+)$", metric)
+    if match:
+        return f"{match.group(1)}_{match.group(2)}"
+    return metric
+
+
+def _read_qrels_dict(path: Path) -> Dict[str, Dict[str, int]]:
+    qrels: Dict[str, Dict[str, int]] = {}
+    with open(path, "r") as handle:
+        for line in handle:
+            parts = line.strip().split()
+            if len(parts) < 4:
+                continue
+            qid, _, docid, rel = parts[:4]
+            try:
+                rel_i = int(rel)
+            except Exception:
+                rel_i = 0
+            if qid not in qrels:
+                qrels[qid] = {}
+            qrels[qid][docid] = rel_i
+    return qrels
+
+
+def _read_run_dict(path: Path) -> Dict[str, Dict[str, float]]:
+    run: Dict[str, Dict[str, float]] = {}
+    with open(path, "r") as handle:
+        for line in handle:
+            parts = line.strip().split()
+            if len(parts) < 6:
+                continue
+            qid, _, docid, _, score, _ = parts[:6]
+            try:
+                score_f = float(score)
+            except Exception:
+                score_f = 0.0
+            if qid not in run:
+                run[qid] = {}
+            run[qid][docid] = score_f
+    return run
+
+
+def run_pytrec_eval(
+    metrics: List[str],
+    qrels_path: Path,
+    run_path: Path,
+    sampled_qids: List[str],
+) -> Dict[str, float]:
+    try:
+        import pytrec_eval  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "Neither trec_eval binary nor pytrec_eval is available. "
+            "Install one of them, e.g. `pip install pytrec_eval`."
+        ) from exc
+
+    py_metrics = [_to_pytrec_metric(m) for m in metrics]
+    evaluator = pytrec_eval.RelevanceEvaluator(_read_qrels_dict(qrels_path), set(py_metrics))
+    per_query = evaluator.evaluate(_read_run_dict(run_path))
+
+    agg: Dict[str, float] = {}
+    denom = max(len(sampled_qids), 1)
+    for req_metric, py_metric in zip(metrics, py_metrics):
+        total = 0.0
+        for qid in sampled_qids:
+            total += float(per_query.get(qid, {}).get(py_metric, 0.0))
+        agg[req_metric] = total / denom
+    return agg
+
+
+def run_eval(
+    trec_eval_bin: Optional[str],
+    metrics: List[str],
+    qrels_path: Path,
+    run_path: Path,
+    sampled_qids: List[str],
+) -> Dict[str, float]:
+    if trec_eval_bin is not None:
+        return run_trec_eval_binary(trec_eval_bin, metrics, qrels_path, run_path)
+    return run_pytrec_eval(metrics, qrels_path, run_path, sampled_qids)
+
+
 def main() -> None:
     args = parse_args()
 
     trec_eval_path = shutil.which(args.trec_eval_bin)
     if trec_eval_path is None:
-        raise FileNotFoundError(
-            f"Could not find trec_eval binary '{args.trec_eval_bin}' in PATH."
+        print(
+            f"Warning: trec_eval binary '{args.trec_eval_bin}' not found in PATH. "
+            "Trying pytrec_eval fallback."
         )
 
     qrels_path = Path(args.qrels)
@@ -202,7 +287,7 @@ def main() -> None:
 
     rows: Dict[str, Dict[str, float]] = {}
     for name, path in sampled_run_paths.items():
-        rows[name] = run_trec_eval(trec_eval_path, metrics, sampled_qrels_path, path)
+        rows[name] = run_eval(trec_eval_path, metrics, sampled_qrels_path, path, sampled)
 
     header = ["run"] + metrics
     print("\nRESULTS")
