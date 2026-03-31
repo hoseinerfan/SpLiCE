@@ -146,3 +146,26 @@ Each line in output JSONL contains:
 - `top_concepts` (list of `{concept, weight}`)
 - `l0_norm`
 - `cosine_similarity`
+
+## 7) Build concept-overlap retrieval rankings
+
+Once you have both:
+- page labels JSONL (e.g., `colpali-v1.2_m3-docvqa_dev_labels.jsonl`)
+- query labels JSONL (e.g., `MMQA_dev_query_labels.jsonl`)
+
+generate a retrieval-ready ranking file:
+
+```bash
+python scripts/concept_overlap_retrieval.py \
+  --query-labels-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_query_labels.jsonl \
+  --page-labels-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev_labels.jsonl \
+  --output-ranking-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_dev_concept_overlap_rankings.jsonl \
+  --topk-pages 100 \
+  --max-shared-concepts 5 \
+  --min-score 0.0
+```
+
+Each output row contains:
+- `query_id`
+- `query_top_concepts`
+- `top_pages`: list of `{page_id, score, shared_concepts}`
