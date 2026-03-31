@@ -34,7 +34,56 @@ Notes:
 - If your query text field is not automatically detected, add `--query-field <field_name>`.
 - If you have a keep list of query IDs, add `--allowlist-file <path>`.
 
-## 3) Label precomputed page/document embeddings
+## 3) Build concept dictionary files (required once)
+
+SpLiCE labeling needs:
+- `colpali_concepts.txt`
+- `colpali_concept_dictionary.pt`
+
+### 3a) Build concept vocabulary from filtered queries
+
+```bash
+python scripts/build_concept_vocab_from_queries.py \
+  --input-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/multimodalqa/MMQA_dev_queries_filtered.jsonl \
+  --output-concepts-txt /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concepts.txt \
+  --output-counts-tsv /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concepts_counts.tsv \
+  --top-unigrams 10000 \
+  --top-bigrams 5000
+```
+
+### 3b) Convert concepts to query JSONL for your ColPali runtime embedder
+
+```bash
+python scripts/concepts_to_queries_jsonl.py \
+  --concepts-txt /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concepts.txt \
+  --output-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concept_queries.jsonl
+```
+
+### 3c) Run your existing ColPali query-embedding job on concept queries
+
+Use your runtime embedding pipeline to embed:
+- Input: `colpali_concept_queries.jsonl`
+- Output directory: `/mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concept_query_embeddings`
+
+Expected output:
+- one embedding file per concept query ID (same ID from JSONL), `.safetensors`/`.pt`/`.npy`
+- each file contains a query embedding tensor compatible with your page embedding space (`dim=128`)
+
+### 3d) Build dictionary tensor from concept embeddings
+
+```bash
+python scripts/build_dictionary_from_concept_embeddings.py \
+  --embeddings-path /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concept_query_embeddings \
+  --concept-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concept_queries.jsonl \
+  --output-dictionary-pt /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concept_dictionary.pt \
+  --output-vocab-txt /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concepts.txt \
+  --recursive \
+  --normalize \
+  --expected-dim 128 \
+  --summary-json /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concept_dictionary_summary.json
+```
+
+## 4) Label precomputed page/document embeddings
 
 Run concept labeling on your page embeddings:
 
@@ -59,23 +108,26 @@ Important:
 - `.safetensors` embeddings are supported directly.
 - For ColPali page stores with tensor shape `[num_pages, 1030, 128]`, use `--layout batch` to label each page.
 
-## 4) Label query embeddings generated at runtime
+## 5) Label query embeddings generated at runtime
 
 When your runtime ColPali pipeline writes query embeddings to disk, run:
 
 ```bash
 python scripts/label_precomputed_embeddings.py \
-  --embeddings-path /path/to/runtime_query_embeddings.pt \
+  --embeddings-path /path/to/runtime_query_embeddings_dir \
   --dictionary-path /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concept_dictionary.pt \
   --vocab-path /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concepts.txt \
   --output-jsonl /path/to/runtime_query_labels.jsonl \
-  --layout batch \
+  --layout single \
+  --recursive \
   --topk 10 \
   --l1-penalty 0.25 \
   --device cuda
 ```
 
-## 5) Output format
+For one-file-per-query stores, use `--layout single` and keep filenames as query IDs.
+
+## 6) Output format
 
 Each line in output JSONL contains:
 - `id`
