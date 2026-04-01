@@ -268,3 +268,29 @@ This reports:
 - top-1 dominance rate
 - generic/non-lexical concept rates
 - flagged and healthy examples
+
+## 12) Post-process and audit page concept labels
+
+For page labels (no query text involved), you can clean noisy concepts and reduce top1 collapse:
+
+```bash
+python scripts/postprocess_page_concepts.py \
+  --labels-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev_labels.jsonl \
+  --output-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev_labels_clean.jsonl \
+  --max-concepts 10 \
+  --drop-generic-concepts \
+  --cap-top1-weight 0.85 \
+  --keep-at-least-one
+```
+
+Then audit a subset:
+
+```bash
+python scripts/audit_page_concept_health.py \
+  --labels-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev_labels_clean.jsonl \
+  --sample-size 100 \
+  --seed 42 \
+  --show-examples 8 \
+  --output-sample-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_page_concept_health_sample.jsonl \
+  --output-summary-json /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_page_concept_health_summary.json
+```
