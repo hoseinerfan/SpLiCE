@@ -294,3 +294,28 @@ python scripts/audit_page_concept_health.py \
   --output-sample-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_page_concept_health_sample.jsonl \
   --output-summary-json /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_page_concept_health_summary.json
 ```
+
+## 13) Rebuild concept vocab from page-side corpus
+
+If query-only vocab misses page entities/names, build concepts from MMQA page-side files:
+
+```bash
+python scripts/build_concept_vocab_from_corpus.py \
+  --input-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/multimodalqa/MMQA_texts.jsonl \
+  --input-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/multimodalqa/MMQA_images.jsonl \
+  --input-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/multimodalqa/MMQA_tables.jsonl \
+  --restrict-embeddings-path /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev \
+  --top-unigrams 30000 \
+  --top-bigrams 20000 \
+  --min-unigram-count 2 \
+  --min-bigram-count 2 \
+  --dedupe-texts-per-record \
+  --output-concepts-txt /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concepts_pageside.txt \
+  --output-counts-tsv /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concepts_pageside_counts.tsv
+```
+
+Then continue as before:
+1. `scripts/concepts_to_queries_jsonl.py` on `colpali_concepts_pageside.txt`
+2. `scripts/embed_colpali_queries.py` for concept embeddings
+3. `scripts/build_dictionary_from_concept_embeddings.py`
+4. relabel pages/queries with the new dictionary
