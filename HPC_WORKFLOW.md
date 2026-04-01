@@ -297,6 +297,22 @@ python scripts/audit_page_concept_health.py \
   --output-summary-json /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/MMQA_page_concept_health_summary.json
 ```
 
+### Dual-pass merge (full dictionary + visual mini-dictionary)
+
+If full-dictionary labels miss localized visual concepts, merge two label files:
+
+```bash
+python scripts/merge_page_concepts_dualpass.py \
+  --base-labels-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev_labels_pageside_query_union_v1_top50_l1_01.jsonl \
+  --attribute-labels-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/debug_d57_mini.jsonl \
+  --output-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev_labels_dualpass_example.jsonl \
+  --base-weight 1.0 \
+  --attribute-weight 0.8 \
+  --topk 50
+```
+
+For production, generate the attribute-label file over the full page store (not a single doc) and then merge.
+
 ## 13) Rebuild concept vocab from page-side corpus
 
 If query-only vocab misses page entities/names, build concepts from MMQA page-side files:
