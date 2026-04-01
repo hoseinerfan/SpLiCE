@@ -16,10 +16,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-labels-path", type=str, required=True, help="Visual-side patch labels JSONL file or directory.")
     parser.add_argument("--output-path", type=str, required=True, help="Output JSONL file or directory.")
     parser.add_argument("--recursive", action="store_true", help="Recursively scan directories for JSONL files.")
+    parser.add_argument(
+        "--merge-mode",
+        type=str,
+        default="blend",
+        choices=["blend", "concat"],
+        help=(
+            "blend: combine text+visual scores before top-k (legacy behavior). "
+            "concat: take top-k from each source first, then union."
+        ),
+    )
     parser.add_argument("--text-weight", type=float, default=1.0)
     parser.add_argument("--visual-weight", type=float, default=1.0)
     parser.add_argument("--topk", type=int, default=10, help="Top-k merged concepts per patch.")
+    parser.add_argument(
+        "--topk-text",
+        type=int,
+        default=0,
+        help="For merge-mode=concat: per-source cap for text concepts (0 means no cap).",
+    )
+    parser.add_argument(
+        "--topk-visual",
+        type=int,
+        default=0,
+        help="For merge-mode=concat: per-source cap for visual concepts (0 means no cap).",
+    )
     parser.add_argument("--min-weight", type=float, default=0.0, help="Drop merged concepts below this score before renorm.")
+    parser.add_argument(
+        "--min-weight-text",
+        type=float,
+        default=0.0,
+        help="For merge-mode=concat: drop text concepts below this source-specific weighted score.",
+    )
+    parser.add_argument(
+        "--min-weight-visual",
+        type=float,
+        default=0.0,
+        help="For merge-mode=concat: drop visual concepts below this source-specific weighted score.",
+    )
     parser.add_argument("--id-field", type=str, default="", help="Row id field (auto if empty).")
     parser.add_argument("--include-visual-only", action="store_true", help="Include rows present only in visual labels.")
     parser.add_argument("--preserve-component-scores", action="store_true", help="Add text_score/visual_score to each merged concept.")
@@ -111,10 +145,15 @@ def load_rows(path: Path, id_field: str) -> Tuple[List[str], Dict[str, Dict]]:
 def merge_concepts(
     text_concepts: List[Dict],
     visual_concepts: List[Dict],
+    merge_mode: str,
     text_weight: float,
     visual_weight: float,
     topk: int,
+    topk_text: int,
+    topk_visual: int,
     min_weight: float,
+    min_weight_text: float,
+    min_weight_visual: float,
     preserve_component_scores: bool,
 ) -> Tuple[List[Dict], Dict[str, int]]:
     t_norm = normalize(text_concepts)
@@ -140,8 +179,31 @@ def merge_concepts(
                 merged[key][3] += score
                 merged[key][5] = 1
 
-    add(t_norm, text_weight, "text")
-    add(v_norm, visual_weight, "visual")
+    if merge_mode == "blend":
+        add(t_norm, text_weight, "text")
+        add(v_norm, visual_weight, "visual")
+    else:
+        # concat mode: keep source-specific top sets first, then merge.
+        t_items = []
+        for item in t_norm:
+            score = float(item["weight"]) * text_weight
+            if score >= min_weight_text:
+                t_items.append({"concept": item["concept"], "score": score})
+        v_items = []
+        for item in v_norm:
+            score = float(item["weight"]) * visual_weight
+            if score >= min_weight_visual:
+                v_items.append({"concept": item["concept"], "score": score})
+
+        t_items.sort(key=lambda x: x["score"], reverse=True)
+        v_items.sort(key=lambda x: x["score"], reverse=True)
+        if topk_text > 0:
+            t_items = t_items[:topk_text]
+        if topk_visual > 0:
+            v_items = v_items[:topk_visual]
+
+        add([{"concept": x["concept"], "weight": x["score"]} for x in t_items], 1.0, "text")
+        add([{"concept": x["concept"], "weight": x["score"]} for x in v_items], 1.0, "visual")
 
     out: List[Dict] = []
     shared = 0
@@ -181,11 +243,17 @@ def merge_concepts(
         out = []
 
     info = {
+        "merge_mode": merge_mode,
         "text_concepts": len(t_norm),
         "visual_concepts": len(v_norm),
         "shared_concepts": shared,
         "merged_concepts": len(out),
     }
+    if merge_mode == "concat":
+        info["topk_text"] = int(topk_text)
+        info["topk_visual"] = int(topk_visual)
+        info["min_weight_text"] = float(min_weight_text)
+        info["min_weight_visual"] = float(min_weight_visual)
     return out, info
 
 
@@ -317,10 +385,15 @@ def main() -> None:
                 merged, info = merge_concepts(
                     text_concepts=parse_concepts(trow),
                     visual_concepts=parse_concepts(vrow),
+                    merge_mode=args.merge_mode,
                     text_weight=args.text_weight,
                     visual_weight=args.visual_weight,
                     topk=args.topk,
+                    topk_text=args.topk_text,
+                    topk_visual=args.topk_visual,
                     min_weight=args.min_weight,
+                    min_weight_text=args.min_weight_text,
+                    min_weight_visual=args.min_weight_visual,
                     preserve_component_scores=args.preserve_component_scores,
                 )
 
@@ -349,10 +422,15 @@ def main() -> None:
         "rows_with_both_sources": rows_both,
         "rows_text_only": rows_text_only,
         "rows_visual_only": rows_visual_only,
+        "merge_mode": args.merge_mode,
         "text_weight": args.text_weight,
         "visual_weight": args.visual_weight,
         "topk": args.topk,
+        "topk_text": args.topk_text,
+        "topk_visual": args.topk_visual,
         "min_weight": args.min_weight,
+        "min_weight_text": args.min_weight_text,
+        "min_weight_visual": args.min_weight_visual,
         "preserve_component_scores": bool(args.preserve_component_scores),
         "include_visual_only": bool(args.include_visual_only),
     }
@@ -365,10 +443,15 @@ def main() -> None:
         "rows_with_both_sources",
         "rows_text_only",
         "rows_visual_only",
+        "merge_mode",
         "text_weight",
         "visual_weight",
         "topk",
+        "topk_text",
+        "topk_visual",
         "min_weight",
+        "min_weight_text",
+        "min_weight_visual",
     ]:
         print(f"{key}: {summary[key]}")
 
