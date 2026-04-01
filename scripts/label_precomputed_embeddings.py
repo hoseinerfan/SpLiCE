@@ -391,7 +391,11 @@ def main() -> None:
         )
     else:
         image_mean = to_tensor(load_object(Path(args.mean_path)))
-        image_mean = _pool_to_vector(image_mean)
+        image_mean = _pool_to_vector(
+            image_mean,
+            token_pooling=args.token_pooling,
+            token_topk=args.token_topk,
+        )
         image_mean = normalize_vector(image_mean)
 
     if image_mean.shape[0] != dictionary.shape[1]:
