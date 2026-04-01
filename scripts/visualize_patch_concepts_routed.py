@@ -59,6 +59,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-token-start", type=int, default=0)
     parser.add_argument("--image-token-count", type=int, default=0)
     parser.add_argument("--top-patches", type=int, default=20)
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=0.0,
+        help="Global minimum concept score for a patch to be considered a hit.",
+    )
+    parser.add_argument(
+        "--concept-min-score",
+        action="append",
+        default=[],
+        help="Per-concept threshold as concept=value (repeatable).",
+    )
+    parser.add_argument(
+        "--concept-min-score-file",
+        type=str,
+        default=None,
+        help="Optional thresholds file: concept<tab|,>value per line.",
+    )
     parser.add_argument("--page-image", type=str, default=None, help="Optional page image path for overlays.")
     parser.add_argument("--overlay-alpha", type=float, default=0.45)
     parser.add_argument("--cmap", type=str, default="magma")
@@ -128,6 +146,47 @@ def parse_route_file(path: Path) -> Dict[str, str]:
     return route
 
 
+def parse_concept_threshold_specs(specs: List[str]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise ValueError(f"Invalid --concept-min-score spec '{spec}'. Use concept=value.")
+        concept, value = spec.split("=", 1)
+        concept = concept.strip().lower()
+        value = value.strip()
+        if not concept:
+            raise ValueError(f"Invalid --concept-min-score spec '{spec}': empty concept.")
+        try:
+            thr = float(value)
+        except Exception:
+            raise ValueError(f"Invalid threshold in spec '{spec}'.")
+        out[concept] = thr
+    return out
+
+
+def parse_concept_threshold_file(path: Path) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    with open(path, "r") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "\t" in line:
+                left, right = line.split("\t", 1)
+            elif "," in line:
+                left, right = line.split(",", 1)
+            else:
+                raise ValueError(f"Invalid threshold line (expected concept<tab|,>value): {line}")
+            concept = left.strip().lower()
+            try:
+                thr = float(right.strip())
+            except Exception:
+                raise ValueError(f"Invalid threshold value in line: {line}")
+            if concept:
+                out[concept] = thr
+    return out
+
+
 def parse_concepts(raw: str) -> List[str]:
     return [x.strip().lower() for x in raw.split(",") if x.strip()]
 
@@ -195,13 +254,14 @@ def concept_grid_and_hits(
     grid_size: int,
     image_token_start: int,
     image_token_count: int,
+    min_score: float,
 ) -> Tuple["np.ndarray", List[Tuple[float, int, int, int]]]:
     assert np is not None
     grid = np.zeros((grid_size, grid_size), dtype=np.float32)
     hits: List[Tuple[float, int, int, int]] = []
     for patch_idx in range(image_token_start, image_token_start + image_token_count):
         score = float(patch_to_scores.get(patch_idx, {}).get(concept, 0.0))
-        if score <= 0:
+        if score < min_score:
             continue
         rel = patch_idx - image_token_start
         row = rel // grid_size
@@ -323,6 +383,10 @@ def main() -> None:
     if not route:
         raise ValueError("No routes provided. Use --route and/or --route-file.")
 
+    concept_thresholds = parse_concept_threshold_specs(args.concept_min_score)
+    if args.concept_min_score_file:
+        concept_thresholds.update(parse_concept_threshold_file(Path(args.concept_min_score_file)))
+
     if args.concepts:
         concepts = parse_concepts(args.concepts)
     else:
@@ -375,6 +439,8 @@ def main() -> None:
     report: Dict[str, object] = {
         "page_id": args.page_id,
         "sources": {k: str(v) for k, v in source_to_labels.items()},
+        "global_min_score": float(args.min_score),
+        "concept_min_scores": concept_thresholds,
         "n_patches": n_patches,
         "grid_size": grid_size,
         "image_token_start": args.image_token_start,
@@ -384,12 +450,14 @@ def main() -> None:
 
     for concept in concepts:
         src = concept_to_source[concept]
+        thr = float(concept_thresholds.get(concept, args.min_score))
         grid, hits = concept_grid_and_hits(
             concept=concept,
             patch_to_scores=source_patch_scores[src],
             grid_size=grid_size,
             image_token_start=args.image_token_start,
             image_token_count=image_token_count,
+            min_score=thr,
         )
         concept_to_grid[concept] = grid
         top_hits = hits[: args.top_patches]
@@ -398,6 +466,7 @@ def main() -> None:
             {
                 "concept": concept,
                 "source": src,
+                "min_score": thr,
                 "max_weight": float(grid.max()) if hits else 0.0,
                 "nonzero_patches": int(np.count_nonzero(grid)),
                 "top_hits": [
