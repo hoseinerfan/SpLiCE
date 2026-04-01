@@ -36,6 +36,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--solver", type=str, default="skl", choices=["skl", "admm"], help="Sparse solver.")
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size for decomposition.")
     parser.add_argument("--layout", type=str, default="auto", choices=["auto", "single", "batch"], help="How to interpret tensor dimensions.")
+    parser.add_argument(
+        "--token-pooling",
+        type=str,
+        default="mean",
+        choices=["mean", "max", "topkmean"],
+        help="How to pool token/patch embeddings into one vector when input has >1 token.",
+    )
+    parser.add_argument(
+        "--token-topk",
+        type=int,
+        default=64,
+        help="Top-k tokens used when --token-pooling=topkmean.",
+    )
     parser.add_argument("--recursive", action="store_true", help="Recursively scan directories for embedding files.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -101,24 +114,34 @@ def list_embedding_files(path: Path, recursive: bool) -> List[Path]:
     return files
 
 
-def _pool_to_vector(tensor: torch.Tensor) -> torch.Tensor:
+def _pool_to_vector(tensor: torch.Tensor, token_pooling: str, token_topk: int) -> torch.Tensor:
     if tensor.ndim == 1:
         return tensor
     flat = tensor.reshape(-1, tensor.shape[-1])
-    return flat.mean(dim=0)
+    if token_pooling == "mean":
+        return flat.mean(dim=0)
+    if token_pooling == "max":
+        return flat.max(dim=0).values
+    # topkmean: average the most salient token vectors by L2 norm.
+    k = max(1, min(int(token_topk), flat.shape[0]))
+    norms = torch.linalg.vector_norm(flat, ord=2, dim=1)
+    top_idx = torch.topk(norms, k=k, largest=True).indices
+    return flat[top_idx].mean(dim=0)
 
 
 def _yield_from_tensor(
     tensor: torch.Tensor,
     base_id: str,
     layout: str,
+    token_pooling: str,
+    token_topk: int,
     ids: Optional[List[str]] = None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     if tensor.ndim == 0:
         raise ValueError(f"Scalar tensor is not a valid embedding: {base_id}")
 
     if layout == "single":
-        yield base_id, _pool_to_vector(tensor)
+        yield base_id, _pool_to_vector(tensor, token_pooling=token_pooling, token_topk=token_topk)
         return
 
     if tensor.ndim == 1:
@@ -128,7 +151,7 @@ def _yield_from_tensor(
     batch_size = tensor.shape[0]
     for idx in range(batch_size):
         sample_id = ids[idx] if ids is not None and idx < len(ids) else f"{base_id}:{idx}"
-        yield sample_id, _pool_to_vector(tensor[idx])
+        yield sample_id, _pool_to_vector(tensor[idx], token_pooling=token_pooling, token_topk=token_topk)
 
 
 def _extract_ids(obj: Dict[str, Any]) -> Optional[List[str]]:
@@ -142,20 +165,39 @@ def parse_embedding_object(
     obj: Any,
     base_id: str,
     layout: str,
+    token_pooling: str,
+    token_topk: int,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     if isinstance(obj, (torch.Tensor,)) or (np is not None and isinstance(obj, np.ndarray)):
-        yield from _yield_from_tensor(to_tensor(obj), base_id, layout)
+        yield from _yield_from_tensor(
+            to_tensor(obj),
+            base_id,
+            layout,
+            token_pooling=token_pooling,
+            token_topk=token_topk,
+        )
         return
 
     if isinstance(obj, dict):
         if "embedding" in obj:
             item_id = str(obj.get("id", obj.get("doc_id", obj.get("query_id", base_id))))
-            yield item_id, _pool_to_vector(to_tensor(obj["embedding"]))
+            yield item_id, _pool_to_vector(
+                to_tensor(obj["embedding"]),
+                token_pooling=token_pooling,
+                token_topk=token_topk,
+            )
             return
 
         if "embeddings" in obj:
             ids = _extract_ids(obj)
-            yield from _yield_from_tensor(to_tensor(obj["embeddings"]), base_id, layout, ids)
+            yield from _yield_from_tensor(
+                to_tensor(obj["embeddings"]),
+                base_id,
+                layout,
+                token_pooling=token_pooling,
+                token_topk=token_topk,
+                ids=ids,
+            )
             return
 
         tensor_items: List[Tuple[str, torch.Tensor]] = []
@@ -167,10 +209,24 @@ def parse_embedding_object(
             ids = _extract_ids(obj)
             if len(tensor_items) == 1:
                 _, tensor = tensor_items[0]
-                yield from _yield_from_tensor(tensor, base_id, layout, ids)
+                yield from _yield_from_tensor(
+                    tensor,
+                    base_id,
+                    layout,
+                    token_pooling=token_pooling,
+                    token_topk=token_topk,
+                    ids=ids,
+                )
             else:
                 for key, tensor in tensor_items:
-                    yield from _yield_from_tensor(tensor, f"{base_id}:{key}", layout, ids=None)
+                    yield from _yield_from_tensor(
+                        tensor,
+                        f"{base_id}:{key}",
+                        layout,
+                        token_pooling=token_pooling,
+                        token_topk=token_topk,
+                        ids=None,
+                    )
             return
 
         raise TypeError(f"Could not parse dict embeddings for: {base_id}. Keys={list(obj.keys())[:10]}")
@@ -180,7 +236,11 @@ def parse_embedding_object(
             return
         for idx, value in enumerate(obj):
             if isinstance(value, torch.Tensor) or (np is not None and isinstance(value, np.ndarray)):
-                yield f"{base_id}:{idx}", _pool_to_vector(to_tensor(value))
+                yield f"{base_id}:{idx}", _pool_to_vector(
+                    to_tensor(value),
+                    token_pooling=token_pooling,
+                    token_topk=token_topk,
+                )
             else:
                 raise TypeError(f"Unsupported list element type in {base_id}: {type(value)}")
         return
@@ -200,12 +260,20 @@ def iter_embeddings(
     embeddings_path: Path,
     recursive: bool,
     layout: str,
+    token_pooling: str,
+    token_topk: int,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     files = list_embedding_files(embeddings_path, recursive)
     for file_path in files:
         obj = load_object(file_path)
         base_id = file_path.stem
-        yield from parse_embedding_object(obj, base_id=base_id, layout=layout)
+        yield from parse_embedding_object(
+            obj,
+            base_id=base_id,
+            layout=layout,
+            token_pooling=token_pooling,
+            token_topk=token_topk,
+        )
 
 
 def normalize_vector(vec: torch.Tensor) -> torch.Tensor:
@@ -221,10 +289,18 @@ def compute_mean(
     embeddings_path: Path,
     recursive: bool,
     layout: str,
+    token_pooling: str,
+    token_topk: int,
 ) -> torch.Tensor:
     running_sum: Optional[torch.Tensor] = None
     count = 0
-    for _, vec in iter_embeddings(embeddings_path, recursive, layout):
+    for _, vec in iter_embeddings(
+        embeddings_path,
+        recursive,
+        layout,
+        token_pooling=token_pooling,
+        token_topk=token_topk,
+    ):
         vec = normalize_vector(vec)
         if running_sum is None:
             running_sum = vec.clone()
@@ -306,7 +382,13 @@ def main() -> None:
 
     if args.mean_path is None:
         print("No --mean-path provided. Computing mean from embeddings...", flush=True)
-        image_mean = compute_mean(embeddings_path, args.recursive, layout)
+        image_mean = compute_mean(
+            embeddings_path,
+            args.recursive,
+            layout,
+            token_pooling=args.token_pooling,
+            token_topk=args.token_topk,
+        )
     else:
         image_mean = to_tensor(load_object(Path(args.mean_path)))
         image_mean = _pool_to_vector(image_mean)
@@ -336,7 +418,13 @@ def main() -> None:
     total = 0
 
     with open(args.output_jsonl, "w") as out_handle:
-        for item_id, vec in iter_embeddings(embeddings_path, args.recursive, layout):
+        for item_id, vec in iter_embeddings(
+            embeddings_path,
+            args.recursive,
+            layout,
+            token_pooling=args.token_pooling,
+            token_topk=args.token_topk,
+        ):
             vec = normalize_vector(vec)
             if vec.shape[0] != dictionary.shape[1]:
                 raise ValueError(

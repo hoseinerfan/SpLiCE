@@ -106,6 +106,7 @@ python scripts/label_precomputed_embeddings.py \
   --vocab-path /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali_concepts.txt \
   --output-jsonl /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev_labels.jsonl \
   --layout batch \
+  --token-pooling mean \
   --recursive \
   --topk 10 \
   --l1-penalty 0.25 \
@@ -119,6 +120,7 @@ Important:
 - If `--mean-path` is omitted, the script estimates mean from your embeddings.
 - `.safetensors` embeddings are supported directly.
 - For ColPali page stores with tensor shape `[num_pages, 1030, 128]`, use `--layout batch` to label each page.
+- For localized visual cues (e.g., glasses), try `--token-pooling max` or `--token-pooling topkmean --token-topk 64`.
 
 ## 5) Label query embeddings generated at runtime
 
