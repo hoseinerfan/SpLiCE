@@ -47,6 +47,35 @@ def parse_args() -> argparse.Namespace:
         help="Used only with overlap_or_center mode.",
     )
     p.add_argument(
+        "--table-expand-from-structure",
+        type=int,
+        default=1,
+        help=(
+            "Grid-cell radius for expanding table_structure before admitting table_text. "
+            "Used to form table_all as structure + nearby table_text."
+        ),
+    )
+    p.add_argument(
+        "--allow-table-text-only-fallback",
+        action="store_true",
+        help=(
+            "Allow table_all from table_text only when no table_structure exists "
+            "(guarded by max-frac/max-components)."
+        ),
+    )
+    p.add_argument(
+        "--table-text-only-max-frac",
+        type=float,
+        default=0.25,
+        help="Max page fraction for table_text-only fallback.",
+    )
+    p.add_argument(
+        "--table-text-only-max-components",
+        type=int,
+        default=4,
+        help="Max connected components for table_text-only fallback.",
+    )
+    p.add_argument(
         "--summary-json",
         type=str,
         default="",
@@ -263,6 +292,50 @@ def render_flat_overlay(
     Image.alpha_composite(img, ov).save(overlay_output)
 
 
+def dilate_cells(
+    cells: Set[Tuple[int, int]],
+    grid_size: int,
+    radius: int,
+) -> Set[Tuple[int, int]]:
+    if radius <= 0 or not cells:
+        return set(cells)
+    out: Set[Tuple[int, int]] = set()
+    for r, c in cells:
+        r0 = max(0, r - radius)
+        r1 = min(grid_size - 1, r + radius)
+        c0 = max(0, c - radius)
+        c1 = min(grid_size - 1, c + radius)
+        for rr in range(r0, r1 + 1):
+            for cc in range(c0, c1 + 1):
+                out.add((rr, cc))
+    return out
+
+
+def count_components(cells: Set[Tuple[int, int]], grid_size: int) -> int:
+    if not cells:
+        return 0
+    seen: Set[Tuple[int, int]] = set()
+    comps = 0
+    for start in cells:
+        if start in seen:
+            continue
+        comps += 1
+        stack = [start]
+        seen.add(start)
+        while stack:
+            r, c = stack.pop()
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                rr = r + dr
+                cc = c + dc
+                if rr < 0 or rr >= grid_size or cc < 0 or cc >= grid_size:
+                    continue
+                nxt = (rr, cc)
+                if nxt in cells and nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+    return comps
+
+
 def main() -> None:
     args = parse_args()
 
@@ -289,6 +362,9 @@ def main() -> None:
 
     # First pass: compute image patch set for the target page.
     image_cells: Set[Tuple[int, int]] = set()
+    page_structure_cells: Set[Tuple[int, int]] = set()
+    page_table_text_cells: Set[Tuple[int, int]] = set()
+    page_ocr_cells: Set[Tuple[int, int]] = set()
     for row in rows:
         if str(row.get("page_id", "")) != args.page_id:
             continue
@@ -300,6 +376,27 @@ def main() -> None:
             grid_size=args.grid_size,
             image_token_start=args.image_token_start,
         )
+
+        struct_w = 0.0
+        table_text_w = 0.0
+        ocr_w = 0.0
+        for item in row.get("top_concepts", []):
+            c = str(item.get("concept", "")).strip().lower()
+            w = float(item.get("weight", 0.0))
+            if c in {"table_structure", "table_all"}:
+                struct_w = max(struct_w, w)
+            elif c == "table_text":
+                table_text_w = max(table_text_w, w)
+            elif c == "ocr_text":
+                ocr_w = max(ocr_w, w)
+
+        if struct_w > 0:
+            page_structure_cells.add((rr, cc))
+        if table_text_w > 0:
+            page_table_text_cells.add((rr, cc))
+        if ocr_w > 0:
+            page_ocr_cells.add((rr, cc))
+
         hit = False
         for b in image_boxes:
             if args.image_hit_mode == "center":
@@ -312,6 +409,34 @@ def main() -> None:
                     break
         if hit:
             image_cells.add((rr, cc))
+
+    # Derive table cells robustly: structure seeds + nearby table_text.
+    table_cells: Set[Tuple[int, int]] = set(page_structure_cells)
+    if page_structure_cells:
+        expanded = dilate_cells(
+            cells=page_structure_cells,
+            grid_size=args.grid_size,
+            radius=max(0, int(args.table_expand_from_structure)),
+        )
+        for cell in page_table_text_cells:
+            if cell in expanded:
+                table_cells.add(cell)
+    elif args.allow_table_text_only_fallback:
+        frac = len(page_table_text_cells) / float(args.grid_size * args.grid_size)
+        comps = count_components(page_table_text_cells, args.grid_size)
+        if (
+            len(page_table_text_cells) > 0
+            and frac <= float(args.table_text_only_max_frac)
+            and comps <= int(args.table_text_only_max_components)
+        ):
+            table_cells = set(page_table_text_cells)
+
+    print(
+        "table derivation -> "
+        f"structure: {len(page_structure_cells)} "
+        f"table_text: {len(page_table_text_cells)} "
+        f"table_all: {len(table_cells)}"
+    )
 
     # Second pass: rewrite concepts for target page.
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,18 +451,22 @@ def main() -> None:
         for row in rows:
             if str(row.get("page_id", "")) == args.page_id:
                 patch_index = int(row.get("patch_index", -1))
-                table_w = 0.0
+                struct_w = 0.0
+                table_text_w = 0.0
                 ocr_w = 0.0
 
                 for item in row.get("top_concepts", []):
                     c = str(item.get("concept", "")).strip().lower()
                     w = float(item.get("weight", 0.0))
-                    if c in {"table_text", "table_structure", "table_all"}:
-                        table_w = max(table_w, w)
+                    if c in {"table_structure", "table_all"}:
+                        struct_w = max(struct_w, w)
+                    elif c == "table_text":
+                        table_text_w = max(table_text_w, w)
                     elif c == "ocr_text":
                         ocr_w = max(ocr_w, w)
 
                 in_image = False
+                in_table = False
                 rr = cc = -1
                 if (
                     patch_index >= args.image_token_start
@@ -349,10 +478,15 @@ def main() -> None:
                         image_token_start=args.image_token_start,
                     )
                     in_image = (rr, cc) in image_cells
+                    in_table = (rr, cc) in table_cells
 
                 # Strict precedence: image only removes OCR on the same patch.
                 if in_image:
                     ocr_w = 0.0
+
+                table_w = 0.0
+                if in_table:
+                    table_w = max(struct_w, table_text_w)
 
                 new_tc: List[Dict] = []
                 if table_w > 0:
@@ -392,7 +526,16 @@ def main() -> None:
         "image_token_count": args.image_token_count,
         "image_hit_mode": args.image_hit_mode,
         "image_overlap_threshold": args.image_overlap_threshold,
+        "table_expand_from_structure": int(args.table_expand_from_structure),
+        "allow_table_text_only_fallback": bool(args.allow_table_text_only_fallback),
+        "table_text_only_max_frac": float(args.table_text_only_max_frac),
+        "table_text_only_max_components": int(args.table_text_only_max_components),
         "pdf_image_boxes": image_boxes,
+        "table_derivation": {
+            "structure_cells": len(page_structure_cells),
+            "table_text_cells": len(page_table_text_cells),
+            "table_all_cells": len(table_cells),
+        },
         "counts": {
             "image_region": int(counts["image_region"]),
             "ocr_text": int(counts["ocr_text"]),
