@@ -111,6 +111,26 @@ def parse_args() -> argparse.Namespace:
         help="Maximum bbox area fraction (of full grid) allowed for rectangle fill.",
     )
     p.add_argument(
+        "--table-component-rect-fill",
+        action="store_true",
+        help=(
+            "Fill bounding boxes of connected components from current table_all mask "
+            "(after structure/text fusion), constrained by size and area caps."
+        ),
+    )
+    p.add_argument(
+        "--table-component-rect-min-cells",
+        type=int,
+        default=12,
+        help="Minimum cells in a table_all component to enable component rectangle fill.",
+    )
+    p.add_argument(
+        "--table-component-rect-max-area-frac",
+        type=float,
+        default=0.20,
+        help="Maximum bbox area fraction allowed for component rectangle fill.",
+    )
+    p.add_argument(
         "--summary-json",
         type=str,
         default="",
@@ -463,6 +483,37 @@ def rect_fill_from_structure(
     return out
 
 
+def rect_fill_from_components(
+    source_cells: Set[Tuple[int, int]],
+    grid_size: int,
+    min_component_cells: int,
+    max_area_frac: float,
+    blocked: Set[Tuple[int, int]],
+) -> Set[Tuple[int, int]]:
+    if not source_cells:
+        return set()
+    out: Set[Tuple[int, int]] = set()
+    comps = connected_components(source_cells, grid_size=grid_size)
+    total_area = float(grid_size * grid_size)
+    for comp in comps:
+        if len(comp) < min_component_cells:
+            continue
+        rs = [r for r, _ in comp]
+        cs = [c for _, c in comp]
+        r0, r1 = min(rs), max(rs)
+        c0, c1 = min(cs), max(cs)
+        area = (r1 - r0 + 1) * (c1 - c0 + 1)
+        if area / total_area > max_area_frac:
+            continue
+        for rr in range(r0, r1 + 1):
+            for cc in range(c0, c1 + 1):
+                rc = (rr, cc)
+                if rc in blocked:
+                    continue
+                out.add(rc)
+    return out
+
+
 def main() -> None:
     args = parse_args()
 
@@ -580,6 +631,17 @@ def main() -> None:
         )
         table_cells |= rect_filled
 
+    # Optional fill from current table components to close remaining internal holes.
+    if args.table_component_rect_fill and table_cells:
+        comp_rect_filled = rect_fill_from_components(
+            source_cells=table_cells,
+            grid_size=args.grid_size,
+            min_component_cells=int(args.table_component_rect_min_cells),
+            max_area_frac=float(args.table_component_rect_max_area_frac),
+            blocked=set(image_cells),
+        )
+        table_cells |= comp_rect_filled
+
     print(
         "table derivation -> "
         f"structure: {len(page_structure_cells)} "
@@ -684,6 +746,9 @@ def main() -> None:
         "table_rect_fill_from_structure": bool(args.table_rect_fill_from_structure),
         "table_rect_fill_min_structure_cells": int(args.table_rect_fill_min_structure_cells),
         "table_rect_fill_max_area_frac": float(args.table_rect_fill_max_area_frac),
+        "table_component_rect_fill": bool(args.table_component_rect_fill),
+        "table_component_rect_min_cells": int(args.table_component_rect_min_cells),
+        "table_component_rect_max_area_frac": float(args.table_component_rect_max_area_frac),
         "pdf_image_boxes": image_boxes,
         "table_derivation": {
             "structure_cells": len(page_structure_cells),
