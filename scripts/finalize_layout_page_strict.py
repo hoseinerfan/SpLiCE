@@ -113,6 +113,49 @@ def patch_box_from_index(
     return row, col, [x0, y0, x1, y1]
 
 
+def box_area(b: List[float]) -> float:
+    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
+def iou(a: List[float], b: List[float]) -> float:
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    inter = (x1 - x0) * (y1 - y0)
+    ua = box_area(a) + box_area(b) - inter
+    return inter / ua if ua > 0 else 0.0
+
+
+def dedupe_boxes(boxes: List[List[float]], iou_thr: float = 0.95) -> List[List[float]]:
+    out: List[List[float]] = []
+    for b in boxes:
+        merged = False
+        for i, c in enumerate(out):
+            if iou(b, c) >= iou_thr:
+                out[i] = [
+                    min(c[0], b[0]),
+                    min(c[1], b[1]),
+                    max(c[2], b[2]),
+                    max(c[3], b[3]),
+                ]
+                merged = True
+                break
+        if not merged:
+            out.append(list(b))
+    return out
+
+
+def normalize_box_xyxy(x0: float, y0: float, x1: float, y1: float, w: float, h: float) -> List[float]:
+    nx0 = max(0.0, min(1.0, x0 / w))
+    ny0 = max(0.0, min(1.0, y0 / h))
+    nx1 = max(0.0, min(1.0, x1 / w))
+    ny1 = max(0.0, min(1.0, y1 / h))
+    return [nx0, ny0, nx1, ny1]
+
+
 def load_pdf_image_boxes(pdf_path: Path, page_index: int) -> List[List[float]]:
     if fitz is None:
         raise RuntimeError("pymupdf is required. Install with: pip install pymupdf")
@@ -129,6 +172,8 @@ def load_pdf_image_boxes(pdf_path: Path, page_index: int) -> List[List[float]]:
         return []
 
     out: List[List[float]] = []
+
+    # Path 1: image blocks from text dict.
     for block in page.get_text("dict").get("blocks", []):
         if int(block.get("type", -1)) != 1:  # image block
             continue
@@ -138,13 +183,31 @@ def load_pdf_image_boxes(pdf_path: Path, page_index: int) -> List[List[float]]:
         x0, y0, x1, y1 = [float(v) for v in bbox]
         if x1 <= x0 or y1 <= y0:
             continue
-        nx0 = max(0.0, min(1.0, x0 / w))
-        ny0 = max(0.0, min(1.0, y0 / h))
-        nx1 = max(0.0, min(1.0, x1 / w))
-        ny1 = max(0.0, min(1.0, y1 / h))
+        nx0, ny0, nx1, ny1 = normalize_box_xyxy(x0, y0, x1, y1, w, h)
         if nx1 > nx0 and ny1 > ny0:
             out.append([nx0, ny0, nx1, ny1])
-    return out
+
+    # Path 2: image xrefs/rects catches pages where text dict has no image blocks.
+    try:
+        for img in page.get_images(full=True):
+            if not img:
+                continue
+            xref = int(img[0])
+            try:
+                rects = page.get_image_rects(xref)
+            except Exception:
+                rects = []
+            for r in rects:
+                x0, y0, x1, y1 = float(r.x0), float(r.y0), float(r.x1), float(r.y1)
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                nx0, ny0, nx1, ny1 = normalize_box_xyxy(x0, y0, x1, y1, w, h)
+                if nx1 > nx0 and ny1 > ny0:
+                    out.append([nx0, ny0, nx1, ny1])
+    except Exception:
+        pass
+
+    return dedupe_boxes(out, iou_thr=0.95)
 
 
 def write_masks(
@@ -212,9 +275,9 @@ def main() -> None:
     if args.image_token_count != args.grid_size * args.grid_size:
         raise ValueError("--image-token-count must equal grid-size^2 for this script.")
 
-    doc_id, page_index = parse_page_id(args.page_id)
+    _, page_index = parse_page_id(args.page_id)
     image_boxes = load_pdf_image_boxes(pdf_path=pdf_path, page_index=page_index)
-    print(f"pdf image blocks: {len(image_boxes)} {image_boxes}")
+    print(f"pdf image boxes: {len(image_boxes)} {image_boxes}")
 
     rows: List[Dict] = []
     with open(labels_path, "r") as f:
