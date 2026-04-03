@@ -76,6 +76,21 @@ def parse_args() -> argparse.Namespace:
         help="Max connected components for table_text-only fallback.",
     )
     p.add_argument(
+        "--table-gap-fill-passes",
+        type=int,
+        default=0,
+        help=(
+            "Number of local gap-fill passes for table_all on the grid. "
+            "Use small values (1-2) to recover unlabeled holes inside tables."
+        ),
+    )
+    p.add_argument(
+        "--table-gap-fill-min-neighbors",
+        type=int,
+        default=3,
+        help="Minimum 4-neighbor table cells required to fill an empty candidate cell.",
+    )
+    p.add_argument(
         "--summary-json",
         type=str,
         default="",
@@ -336,6 +351,39 @@ def count_components(cells: Set[Tuple[int, int]], grid_size: int) -> int:
     return comps
 
 
+def fill_table_gaps(
+    table_cells: Set[Tuple[int, int]],
+    grid_size: int,
+    passes: int,
+    min_neighbors: int,
+    blocked: Set[Tuple[int, int]],
+) -> Set[Tuple[int, int]]:
+    if passes <= 0 or not table_cells:
+        return set(table_cells)
+    cells = set(table_cells)
+    for _ in range(passes):
+        to_add: Set[Tuple[int, int]] = set()
+        for r in range(grid_size):
+            for c in range(grid_size):
+                rc = (r, c)
+                if rc in cells or rc in blocked:
+                    continue
+                n = 0
+                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    rr = r + dr
+                    cc = c + dc
+                    if rr < 0 or rr >= grid_size or cc < 0 or cc >= grid_size:
+                        continue
+                    if (rr, cc) in cells:
+                        n += 1
+                if n >= min_neighbors:
+                    to_add.add(rc)
+        if not to_add:
+            break
+        cells |= to_add
+    return cells
+
+
 def main() -> None:
     args = parse_args()
 
@@ -430,6 +478,17 @@ def main() -> None:
             and comps <= int(args.table_text_only_max_components)
         ):
             table_cells = set(page_table_text_cells)
+
+    # Optional gap fill for unlabeled holes inside table regions.
+    if args.table_gap_fill_passes > 0 and table_cells:
+        blocked = set(image_cells) | set(page_ocr_cells)
+        table_cells = fill_table_gaps(
+            table_cells=table_cells,
+            grid_size=args.grid_size,
+            passes=int(args.table_gap_fill_passes),
+            min_neighbors=int(args.table_gap_fill_min_neighbors),
+            blocked=blocked,
+        )
 
     print(
         "table derivation -> "
@@ -530,6 +589,8 @@ def main() -> None:
         "allow_table_text_only_fallback": bool(args.allow_table_text_only_fallback),
         "table_text_only_max_frac": float(args.table_text_only_max_frac),
         "table_text_only_max_components": int(args.table_text_only_max_components),
+        "table_gap_fill_passes": int(args.table_gap_fill_passes),
+        "table_gap_fill_min_neighbors": int(args.table_gap_fill_min_neighbors),
         "pdf_image_boxes": image_boxes,
         "table_derivation": {
             "structure_cells": len(page_structure_cells),
