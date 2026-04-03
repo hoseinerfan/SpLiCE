@@ -91,6 +91,26 @@ def parse_args() -> argparse.Namespace:
         help="Minimum 4-neighbor table cells required to fill an empty candidate cell.",
     )
     p.add_argument(
+        "--table-rect-fill-from-structure",
+        action="store_true",
+        help=(
+            "Fill bounding boxes of connected table_structure components "
+            "(constrained by component size and area caps)."
+        ),
+    )
+    p.add_argument(
+        "--table-rect-fill-min-structure-cells",
+        type=int,
+        default=10,
+        help="Minimum cells in a table_structure component to enable rectangle fill.",
+    )
+    p.add_argument(
+        "--table-rect-fill-max-area-frac",
+        type=float,
+        default=0.28,
+        help="Maximum bbox area fraction (of full grid) allowed for rectangle fill.",
+    )
+    p.add_argument(
         "--summary-json",
         type=str,
         default="",
@@ -351,6 +371,34 @@ def count_components(cells: Set[Tuple[int, int]], grid_size: int) -> int:
     return comps
 
 
+def connected_components(
+    cells: Set[Tuple[int, int]],
+    grid_size: int,
+) -> List[Set[Tuple[int, int]]]:
+    comps: List[Set[Tuple[int, int]]] = []
+    seen: Set[Tuple[int, int]] = set()
+    for start in cells:
+        if start in seen:
+            continue
+        comp: Set[Tuple[int, int]] = set()
+        stack = [start]
+        seen.add(start)
+        while stack:
+            r, c = stack.pop()
+            comp.add((r, c))
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                rr = r + dr
+                cc = c + dc
+                if rr < 0 or rr >= grid_size or cc < 0 or cc >= grid_size:
+                    continue
+                nxt = (rr, cc)
+                if nxt in cells and nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        comps.append(comp)
+    return comps
+
+
 def fill_table_gaps(
     table_cells: Set[Tuple[int, int]],
     grid_size: int,
@@ -382,6 +430,37 @@ def fill_table_gaps(
             break
         cells |= to_add
     return cells
+
+
+def rect_fill_from_structure(
+    structure_cells: Set[Tuple[int, int]],
+    grid_size: int,
+    min_component_cells: int,
+    max_area_frac: float,
+    blocked: Set[Tuple[int, int]],
+) -> Set[Tuple[int, int]]:
+    if not structure_cells:
+        return set()
+    out: Set[Tuple[int, int]] = set()
+    comps = connected_components(structure_cells, grid_size=grid_size)
+    total_area = float(grid_size * grid_size)
+    for comp in comps:
+        if len(comp) < min_component_cells:
+            continue
+        rs = [r for r, _ in comp]
+        cs = [c for _, c in comp]
+        r0, r1 = min(rs), max(rs)
+        c0, c1 = min(cs), max(cs)
+        area = (r1 - r0 + 1) * (c1 - c0 + 1)
+        if area / total_area > max_area_frac:
+            continue
+        for rr in range(r0, r1 + 1):
+            for cc in range(c0, c1 + 1):
+                rc = (rr, cc)
+                if rc in blocked:
+                    continue
+                out.add(rc)
+    return out
 
 
 def main() -> None:
@@ -490,6 +569,17 @@ def main() -> None:
             blocked=blocked,
         )
 
+    # Optional stronger fill: close rectangular gaps inside structure components.
+    if args.table_rect_fill_from_structure and page_structure_cells:
+        rect_filled = rect_fill_from_structure(
+            structure_cells=page_structure_cells,
+            grid_size=args.grid_size,
+            min_component_cells=int(args.table_rect_fill_min_structure_cells),
+            max_area_frac=float(args.table_rect_fill_max_area_frac),
+            blocked=set(image_cells),  # do not overwrite detected image patches
+        )
+        table_cells |= rect_filled
+
     print(
         "table derivation -> "
         f"structure: {len(page_structure_cells)} "
@@ -591,6 +681,9 @@ def main() -> None:
         "table_text_only_max_components": int(args.table_text_only_max_components),
         "table_gap_fill_passes": int(args.table_gap_fill_passes),
         "table_gap_fill_min_neighbors": int(args.table_gap_fill_min_neighbors),
+        "table_rect_fill_from_structure": bool(args.table_rect_fill_from_structure),
+        "table_rect_fill_min_structure_cells": int(args.table_rect_fill_min_structure_cells),
+        "table_rect_fill_max_area_frac": float(args.table_rect_fill_max_area_frac),
         "pdf_image_boxes": image_boxes,
         "table_derivation": {
             "structure_cells": len(page_structure_cells),
