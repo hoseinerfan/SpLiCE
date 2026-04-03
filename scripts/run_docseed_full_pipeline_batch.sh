@@ -28,6 +28,8 @@ Usage:
     [--backend transformers] \
     [--batch-size 16] \
     [--dtype bfloat16] \
+    [--fallback-text-ids-max 8] \
+    [--no-strict-query-overlap] \
     [--skip-existing]
 EOF
 }
@@ -53,6 +55,8 @@ BACKEND="transformers"
 BATCH_SIZE="16"
 DTYPE="bfloat16"
 DEVICE="cuda:0"
+FALLBACK_TEXT_IDS_MAX="8"
+STRICT_QUERY_OVERLAP=1
 SKIP_EXISTING=0
 
 while [[ $# -gt 0 ]]; do
@@ -72,6 +76,8 @@ while [[ $# -gt 0 ]]; do
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --dtype) DTYPE="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
+    --fallback-text-ids-max) FALLBACK_TEXT_IDS_MAX="$2"; shift 2 ;;
+    --no-strict-query-overlap) STRICT_QUERY_OVERLAP=0; shift ;;
     --skip-existing) SKIP_EXISTING=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -111,7 +117,11 @@ BUILD_CMD=(
   --batch-size "${BATCH_SIZE}"
   --dtype "${DTYPE}"
   --device "${DEVICE}"
+  --fallback-text-ids-max "${FALLBACK_TEXT_IDS_MAX}"
 )
+if [[ "${STRICT_QUERY_OVERLAP}" -eq 1 ]]; then
+  BUILD_CMD+=(--strict-require-query-overlap)
+fi
 echo "+ ${BUILD_CMD[*]}"
 "${BUILD_CMD[@]}"
 

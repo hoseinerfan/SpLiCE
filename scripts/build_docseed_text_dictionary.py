@@ -67,6 +67,26 @@ STOPWORDS = {
     "down",
     "left",
     "right",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "first",
+    "second",
+    "third",
+    "fourth",
+    "fifth",
+    "sixth",
+    "seventh",
+    "eighth",
+    "ninth",
+    "tenth",
 }
 
 GENERIC_BLACKLIST = {
@@ -84,6 +104,7 @@ GENERIC_BLACKLIST = {
     "man",
     "woman",
     "whose",
+    "text",
     "his",
     "her",
     "its",
@@ -119,6 +140,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="For concepts not appearing in linked query lexicon, minimum corpus count to keep.",
+    )
+    parser.add_argument(
+        "--strict-require-query-overlap",
+        action="store_true",
+        help=(
+            "Keep only concepts that overlap linked query tokens/phrases "
+            "(recommended to reduce noisy concepts)."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-text-ids-max",
+        type=int,
+        default=8,
+        help=(
+            "If no evidence-linked text ids are found for a doc, fallback to at most this many "
+            "metadata.text_doc_ids (in first-seen order)."
+        ),
     )
     parser.add_argument(
         "--build-dictionary",
@@ -232,6 +270,47 @@ def build_query_lexicon(linked_dev_rows: List[Dict], min_len: int) -> Set[str]:
     return lex
 
 
+def query_token_set(query_lex: Set[str]) -> Set[str]:
+    out: Set[str] = set()
+    for item in query_lex:
+        for tok in item.split():
+            tok = tok.strip()
+            if tok:
+                out.add(tok)
+    return out
+
+
+def extract_doc_ids_from_instances(instances: object) -> Set[str]:
+    out: Set[str] = set()
+    if not isinstance(instances, list):
+        return out
+    for item in instances:
+        if not isinstance(item, dict):
+            continue
+        doc_id = str(item.get("doc_id", "")).strip()
+        if doc_id:
+            out.add(doc_id)
+    return out
+
+
+def iter_answer_like_records(dev_row: Dict) -> Iterator[Dict]:
+    answers = dev_row.get("answers", [])
+    if isinstance(answers, list):
+        for item in answers:
+            if isinstance(item, dict):
+                yield item
+
+    meta = dev_row.get("metadata", {}) if isinstance(dev_row.get("metadata"), dict) else {}
+    inter = meta.get("intermediate_answers", [])
+    if isinstance(inter, list):
+        for group in inter:
+            if not isinstance(group, list):
+                continue
+            for item in group:
+                if isinstance(item, dict):
+                    yield item
+
+
 def flatten_table_record(table_row: Dict) -> str:
     table_obj = table_row.get("table", {})
     if not isinstance(table_obj, dict):
@@ -301,9 +380,11 @@ def load_counts_tsv(path: Path) -> List[Tuple[str, str, int]]:
 def strict_filter(
     counts: List[Tuple[str, str, int]],
     query_lex: Set[str],
+    query_tokens: Set[str],
     min_len: int,
     min_nonquery_count: int,
     max_concepts: int,
+    require_query_overlap: bool,
 ) -> List[str]:
     kept: List[str] = []
     seen: Set[str] = set()
@@ -319,6 +400,9 @@ def strict_filter(
         if all(t in STOPWORDS for t in toks):
             continue
         if concept in GENERIC_BLACKLIST and concept not in query_lex:
+            continue
+        has_query_overlap = (concept in query_lex) or any(t in query_tokens for t in toks)
+        if require_query_overlap and not has_query_overlap:
             continue
         if concept not in query_lex and cnt < min_nonquery_count:
             continue
@@ -345,6 +429,8 @@ def main() -> None:
             "linked_dev_full": [],
             "text_ids": set(),
             "table_ids": set(),
+            "fallback_text_ids": [],
+            "fallback_text_seen": set(),
         }
         for d in doc_ids
     }
@@ -358,14 +444,42 @@ def main() -> None:
                 continue
             state[doc_id]["linked_dev_full"].append({"source_file": str(dev_path), "line": line_no, "record": row})
             meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+
+            # Prefer evidence-linked context over broad candidate pools.
+            for ctx in row.get("supporting_context", []) if isinstance(row.get("supporting_context"), list) else []:
+                if not isinstance(ctx, dict):
+                    continue
+                ctx_id = str(ctx.get("doc_id", "")).strip()
+                if not ctx_id:
+                    continue
+                part = str(ctx.get("doc_part", ctx.get("part", ""))).strip().lower()
+                if part == "text":
+                    state[doc_id]["text_ids"].add(ctx_id)
+                elif part == "table":
+                    state[doc_id]["table_ids"].add(ctx_id)
+
+            for ans in iter_answer_like_records(row):
+                state[doc_id]["text_ids"].update(extract_doc_ids_from_instances(ans.get("text_instances", [])))
+
             table_id = meta.get("table_id")
             if isinstance(table_id, str) and table_id.strip():
                 state[doc_id]["table_ids"].add(table_id.strip())
+
             text_doc_ids = meta.get("text_doc_ids", [])
             if isinstance(text_doc_ids, list):
                 for tid in text_doc_ids:
                     if isinstance(tid, str) and tid.strip():
-                        state[doc_id]["text_ids"].add(tid.strip())
+                        tid = tid.strip()
+                        if tid not in state[doc_id]["fallback_text_seen"]:
+                            state[doc_id]["fallback_text_seen"].add(tid)
+                            state[doc_id]["fallback_text_ids"].append(tid)
+
+    for doc_id in doc_ids:
+        if state[doc_id]["text_ids"]:
+            continue
+        fallback = state[doc_id]["fallback_text_ids"][: max(0, int(args.fallback_text_ids_max))]
+        for tid in fallback:
+            state[doc_id]["text_ids"].add(tid)
 
     all_text_ids: Set[str] = set()
     all_table_ids: Set[str] = set()
@@ -481,13 +595,16 @@ def main() -> None:
         )
 
         query_lex = build_query_lexicon(linked_dev_rows, min_len=args.min_token_len)
+        query_tokens = query_token_set(query_lex)
         counts = load_counts_tsv(raw_counts)
         strict_concepts = strict_filter(
             counts=counts,
             query_lex=query_lex,
+            query_tokens=query_tokens,
             min_len=args.min_token_len,
             min_nonquery_count=args.strict_min_count_nonquery,
             max_concepts=args.strict_max_concepts,
+            require_query_overlap=args.strict_require_query_overlap,
         )
 
         strict_path = doc_dir / "doc_seed_concepts_text_strict.txt"
