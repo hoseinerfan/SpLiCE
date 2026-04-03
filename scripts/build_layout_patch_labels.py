@@ -55,13 +55,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-token-start", type=int, default=0, help="Image token start index.")
     parser.add_argument("--image-token-count", type=int, default=1024, help="Image token count.")
     parser.add_argument("--min-word-conf", type=float, default=45.0, help="OCR confidence threshold.")
+    parser.add_argument("--min-word-len", type=int, default=2, help="Minimum normalized OCR token length.")
+    parser.add_argument(
+        "--max-word-box-area-frac",
+        type=float,
+        default=0.02,
+        help="Drop OCR word boxes larger than this fraction of page area.",
+    )
     parser.add_argument("--min-overlap-text", type=float, default=0.08, help="Min patch overlap with OCR word box.")
     parser.add_argument("--min-overlap-table", type=float, default=0.10, help="Min patch overlap with table box.")
+    parser.add_argument(
+        "--table-expand-x",
+        type=float,
+        default=0.02,
+        help="Expand detected table boxes horizontally by this normalized margin per side.",
+    )
+    parser.add_argument(
+        "--table-expand-y",
+        type=float,
+        default=0.02,
+        help="Expand detected table boxes vertically by this normalized margin per side.",
+    )
+    parser.add_argument(
+        "--table-dilate-cells",
+        type=int,
+        default=1,
+        help="Dilate table-hit patch cells by this radius.",
+    )
     parser.add_argument(
         "--text-dilate-cells",
         type=int,
         default=1,
         help="Dilate OCR-hit patch cells by this radius to better cover tables.",
+    )
+    parser.add_argument(
+        "--text-neighbor-radius",
+        type=int,
+        default=1,
+        help="Neighborhood radius for suppressing isolated OCR text hits outside tables.",
+    )
+    parser.add_argument(
+        "--min-text-neighbors",
+        type=int,
+        default=1,
+        help="Min neighboring OCR-hit patches (outside tables) required to keep a text patch.",
+    )
+    parser.add_argument(
+        "--text-max-visual-score",
+        type=float,
+        default=0.30,
+        help="If visual score exceeds this, do not assign ocr_text outside tables.",
     )
 
     parser.add_argument(
@@ -75,6 +118,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.85,
         help="Table detector confidence threshold.",
+    )
+    parser.add_argument(
+        "--min-table-area-frac",
+        type=float,
+        default=0.01,
+        help="Ignore detected table boxes smaller than this normalized page area.",
+    )
+    parser.add_argument(
+        "--max-table-area-frac",
+        type=float,
+        default=0.70,
+        help="Ignore detected table boxes larger than this normalized page area.",
     )
     parser.add_argument(
         "--disable-table-detector",
@@ -139,6 +194,22 @@ def overlap_fraction_of_patch(a: List[float], b: List[float]) -> float:
     return inter / patch_area if patch_area > 0 else 0.0
 
 
+def center_in_box(a: List[float], b: List[float]) -> bool:
+    cx = 0.5 * (a[0] + a[2])
+    cy = 0.5 * (a[1] + a[3])
+    return (b[0] <= cx <= b[2]) and (b[1] <= cy <= b[3])
+
+
+def expand_box_norm(box: List[float], dx: float, dy: float) -> List[float]:
+    x0 = max(0.0, box[0] - dx)
+    y0 = max(0.0, box[1] - dy)
+    x1 = min(1.0, box[2] + dx)
+    y1 = min(1.0, box[3] + dy)
+    if x1 <= x0 or y1 <= y0:
+        return box
+    return [x0, y0, x1, y1]
+
+
 def expand_allowed(allowed: Set[int], grid_size: int, image_token_start: int, radius: int) -> Set[int]:
     if radius <= 0 or not allowed:
         return allowed
@@ -156,6 +227,57 @@ def expand_allowed(allowed: Set[int], grid_size: int, image_token_start: int, ra
     return out
 
 
+def count_neighbors(
+    patch_index: int,
+    mask: Set[int],
+    grid_size: int,
+    image_token_start: int,
+    radius: int,
+) -> int:
+    rel = patch_index - image_token_start
+    row = rel // grid_size
+    col = rel % grid_size
+    cnt = 0
+    for dr in range(-radius, radius + 1):
+        for dc in range(-radius, radius + 1):
+            if dr == 0 and dc == 0:
+                continue
+            rr = row + dr
+            cc = col + dc
+            if 0 <= rr < grid_size and 0 <= cc < grid_size:
+                p = image_token_start + rr * grid_size + cc
+                if p in mask:
+                    cnt += 1
+    return cnt
+
+
+def filter_isolated_hits(
+    hits: Set[int],
+    table_hits: Set[int],
+    grid_size: int,
+    image_token_start: int,
+    radius: int,
+    min_neighbors: int,
+) -> Set[int]:
+    if min_neighbors <= 0 or radius <= 0 or not hits:
+        return set(hits)
+    out: Set[int] = set()
+    for p in hits:
+        if p in table_hits:
+            out.add(p)
+            continue
+        n = count_neighbors(
+            patch_index=p,
+            mask=hits,
+            grid_size=grid_size,
+            image_token_start=image_token_start,
+            radius=radius,
+        )
+        if n >= min_neighbors:
+            out.add(p)
+    return out
+
+
 def load_rows(path: Path) -> List[Dict]:
     rows: List[Dict] = []
     with open(path, "r") as handle:
@@ -167,7 +289,12 @@ def load_rows(path: Path) -> List[Dict]:
     return rows
 
 
-def load_ocr_boxes(ocr_jsonl: Path, min_conf: float) -> Dict[str, List[List[float]]]:
+def load_ocr_boxes(
+    ocr_jsonl: Path,
+    min_conf: float,
+    min_word_len: int,
+    max_word_box_area_frac: float,
+) -> Dict[str, List[List[float]]]:
     page_boxes: Dict[str, List[List[float]]] = {}
     with open(ocr_jsonl, "r") as handle:
         for line in handle:
@@ -187,6 +314,9 @@ def load_ocr_boxes(ocr_jsonl: Path, min_conf: float) -> Dict[str, List[List[floa
                 conf = float(word.get("conf", -1.0))
                 if conf < min_conf:
                     continue
+                norm = str(word.get("norm", "")).strip()
+                if len(norm) < max(0, min_word_len):
+                    continue
                 box = word.get("bbox_xyxy", [])
                 if not isinstance(box, list) or len(box) != 4:
                     continue
@@ -194,6 +324,9 @@ def load_ocr_boxes(ocr_jsonl: Path, min_conf: float) -> Dict[str, List[List[floa
                     continue
                 x0, y0, x1, y1 = [float(v) for v in box]
                 if x1 <= x0 or y1 <= y0:
+                    continue
+                area_frac = ((x1 - x0) * (y1 - y0)) / (width * height)
+                if area_frac > max_word_box_area_frac:
                     continue
                 boxes.append([x0 / width, y0 / height, x1 / width, y1 / height])
             page_boxes[page_id] = boxes
@@ -229,7 +362,14 @@ def load_visual_max_map(path: Optional[Path]) -> Dict[Tuple[str, int], float]:
 
 
 class TableDetector:
-    def __init__(self, model_name: str, device: str, score_thr: float) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        device: str,
+        score_thr: float,
+        min_area_frac: float,
+        max_area_frac: float,
+    ) -> None:
         if torch is None:
             raise RuntimeError("torch is required for table detection. Install with: pip install torch")
         if Image is None:
@@ -239,6 +379,8 @@ class TableDetector:
                 "transformers is required for table detection. Install with: pip install transformers"
             )
         self.score_thr = score_thr
+        self.min_area_frac = min_area_frac
+        self.max_area_frac = max_area_frac
         self.device = torch.device(device)
         self.processor = AutoImageProcessor.from_pretrained(model_name)
         self.model = TableTransformerForObjectDetection.from_pretrained(model_name).to(self.device)
@@ -279,7 +421,11 @@ class TableDetector:
             y1 = max(0.0, min(float(h), y1))
             if x1 <= x0 or y1 <= y0:
                 continue
-            boxes.append([x0 / w, y0 / h, x1 / w, y1 / h])
+            nx0, ny0, nx1, ny1 = [x0 / w, y0 / h, x1 / w, y1 / h]
+            area = max(0.0, nx1 - nx0) * max(0.0, ny1 - ny0)
+            if area < self.min_area_frac or area > self.max_area_frac:
+                continue
+            boxes.append([nx0, ny0, nx1, ny1])
         return boxes
 
 
@@ -306,7 +452,12 @@ def main() -> None:
     if not page_ids:
         raise ValueError(f"No page rows found in {labels_path}")
 
-    ocr_boxes = load_ocr_boxes(ocr_path, min_conf=args.min_word_conf)
+    ocr_boxes = load_ocr_boxes(
+        ocr_jsonl=ocr_path,
+        min_conf=args.min_word_conf,
+        min_word_len=args.min_word_len,
+        max_word_box_area_frac=args.max_word_box_area_frac,
+    )
     visual_max = load_visual_max_map(vis_path)
 
     detector: Optional[TableDetector] = None
@@ -315,6 +466,8 @@ def main() -> None:
             model_name=args.table_model_name,
             device=args.device,
             score_thr=args.table_score_threshold,
+            min_area_frac=args.min_table_area_frac,
+            max_area_frac=args.max_table_area_frac,
         )
 
     page_text_hits: Dict[str, Set[int]] = {}
@@ -328,9 +481,14 @@ def main() -> None:
             raise FileNotFoundError(f"Missing page image: {image_path}")
 
         table_boxes = detector.detect_normalized_boxes(image_path) if detector else []
+        if table_boxes:
+            table_boxes = [
+                expand_box_norm(box=b, dx=args.table_expand_x, dy=args.table_expand_y)
+                for b in table_boxes
+            ]
         page_table_boxes[page_id] = table_boxes
 
-        text_hits: Set[int] = set()
+        text_hits_raw: Set[int] = set()
         table_hits: Set[int] = set()
 
         for patch_index in range(args.image_token_start, args.image_token_start + args.image_token_count):
@@ -342,23 +500,43 @@ def main() -> None:
 
             for box in ocr_boxes.get(page_id, []):
                 if overlap_fraction_of_patch(pb, box) >= args.min_overlap_text:
-                    text_hits.add(patch_index)
+                    text_hits_raw.add(patch_index)
                     break
 
             for box in table_boxes:
-                if overlap_fraction_of_patch(pb, box) >= args.min_overlap_table:
+                if (
+                    overlap_fraction_of_patch(pb, box) >= args.min_overlap_table
+                    or center_in_box(pb, box)
+                ):
                     table_hits.add(patch_index)
                     break
 
+        if args.table_dilate_cells > 0:
+            table_hits = expand_allowed(
+                allowed=table_hits,
+                grid_size=args.grid_size,
+                image_token_start=args.image_token_start,
+                radius=args.table_dilate_cells,
+            )
+
+        text_hits_clean = filter_isolated_hits(
+            hits=text_hits_raw,
+            table_hits=table_hits,
+            grid_size=args.grid_size,
+            image_token_start=args.image_token_start,
+            radius=args.text_neighbor_radius,
+            min_neighbors=args.min_text_neighbors,
+        )
+
         if args.text_dilate_cells > 0:
-            text_hits = expand_allowed(
-                allowed=text_hits,
+            text_hits_clean = expand_allowed(
+                allowed=text_hits_clean,
                 grid_size=args.grid_size,
                 image_token_start=args.image_token_start,
                 radius=args.text_dilate_cells,
             )
 
-        page_text_hits[page_id] = text_hits
+        page_text_hits[page_id] = text_hits_clean
         page_table_hits[page_id] = table_hits
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -390,9 +568,17 @@ def main() -> None:
                     counts["table_structure"] += 1
                     per_page[page_id]["table_structure"] += 1
                 elif in_text:
-                    labels = [{"concept": "ocr_text", "weight": 1.0}]
-                    counts["ocr_text"] += 1
-                    per_page[page_id]["ocr_text"] += 1
+                    if vis_score <= args.text_max_visual_score:
+                        labels = [{"concept": "ocr_text", "weight": 1.0}]
+                        counts["ocr_text"] += 1
+                        per_page[page_id]["ocr_text"] += 1
+                    elif vis_score >= args.visual_min_score:
+                        labels = [{"concept": "visual_region", "weight": round(vis_score, 6)}]
+                        counts["visual_region"] += 1
+                        per_page[page_id]["visual_region"] += 1
+                    else:
+                        counts["unlabeled"] += 1
+                        per_page[page_id]["unlabeled"] += 1
                 elif vis_score >= args.visual_min_score:
                     labels = [{"concept": "visual_region", "weight": round(vis_score, 6)}]
                     counts["visual_region"] += 1
