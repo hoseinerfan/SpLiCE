@@ -455,41 +455,58 @@ def infer_table_boxes_from_ocr(
         else:
             rows.append([w])
 
-    rows = [r for r in rows if len(r) >= max(1, min_words_per_row)]
-    if len(rows) < max(1, min_rows):
-        return []
-
-    row_bins: List[Set[int]] = []
+    row_infos = []
     for r in rows:
-        bins = {int(round(w[4] / max(col_tol, 1e-6))) for w in r}
-        row_bins.append(bins)
-
-    col_counts = defaultdict(int)
-    for bins in row_bins:
-        for b in bins:
-            col_counts[b] += 1
-    min_col_support = max(2, int(round(0.5 * len(rows))))
-    good_cols = {b for b, c in col_counts.items() if c >= min_col_support}
-    if len(good_cols) < max(1, min_cols):
-        return []
-
-    kept = []
-    for r, bins in zip(rows, row_bins):
-        if len(good_cols.intersection(bins)) < max(1, min_cols):
+        if len(r) < max(1, min_words_per_row):
             continue
-        kept.extend(r)
-    if len(kept) < max(1, min_words):
+        bins = {int(round(w[4] / max(col_tol, 1e-6))) for w in r}
+        if len(bins) < max(1, min_cols):
+            continue
+        cy = sum(w[5] for w in r) / len(r)
+        row_infos.append((cy, r, bins))
+
+    if len(row_infos) < max(1, min_rows):
         return []
 
-    x0 = min(w[0] for w in kept)
-    y0 = min(w[1] for w in kept)
-    x1 = max(w[2] for w in kept)
-    y1 = max(w[3] for w in kept)
-    box = expand_box_norm([x0, y0, x1, y1], expand, expand)
-    area = box_area(box)
-    if area < min_area_frac or area > max_area_frac:
-        return []
-    return [box]
+    row_infos.sort(key=lambda x: x[0])
+
+    # Split OCR rows into contiguous bands to avoid one oversized page-wide table.
+    groups: List[List[Tuple[float, List[Tuple[float, float, float, float, float, float]], Set[int]]]] = []
+    for info in row_infos:
+        if not groups:
+            groups.append([info])
+            continue
+        prev_cy = groups[-1][-1][0]
+        if (info[0] - prev_cy) <= max(row_tol * 3.0, 0.012):
+            groups[-1].append(info)
+        else:
+            groups.append([info])
+
+    out_boxes: List[List[float]] = []
+    for g in groups:
+        if len(g) < max(1, min_rows):
+            continue
+        kept_words = []
+        col_union: Set[int] = set()
+        for _, r, bins in g:
+            kept_words.extend(r)
+            col_union.update(bins)
+        if len(kept_words) < max(1, min_words):
+            continue
+        if len(col_union) < max(1, min_cols):
+            continue
+
+        x0 = min(w[0] for w in kept_words)
+        y0 = min(w[1] for w in kept_words)
+        x1 = max(w[2] for w in kept_words)
+        y1 = max(w[3] for w in kept_words)
+        box = expand_box_norm([x0, y0, x1, y1], expand, expand)
+        area = box_area(box)
+        if area < min_area_frac or area > max_area_frac:
+            continue
+        out_boxes.append(box)
+
+    return out_boxes
 
 
 def load_visual_max_map(path: Optional[Path]) -> Dict[Tuple[str, int], float]:
