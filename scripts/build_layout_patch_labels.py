@@ -132,6 +132,53 @@ def parse_args() -> argparse.Namespace:
         help="Ignore detected table boxes larger than this normalized page area.",
     )
     parser.add_argument(
+        "--enable-ocr-table-fallback",
+        action="store_true",
+        help="Infer table boxes from OCR row/column regularity and union with detector boxes.",
+    )
+    parser.add_argument(
+        "--ocr-table-row-tol",
+        type=float,
+        default=0.015,
+        help="Row clustering tolerance in normalized Y for OCR-table fallback.",
+    )
+    parser.add_argument(
+        "--ocr-table-col-tol",
+        type=float,
+        default=0.040,
+        help="Column bin width in normalized X for OCR-table fallback.",
+    )
+    parser.add_argument(
+        "--ocr-table-min-rows",
+        type=int,
+        default=4,
+        help="Minimum OCR rows required to form a fallback table box.",
+    )
+    parser.add_argument(
+        "--ocr-table-min-cols",
+        type=int,
+        default=3,
+        help="Minimum OCR columns required to form a fallback table box.",
+    )
+    parser.add_argument(
+        "--ocr-table-min-words-per-row",
+        type=int,
+        default=3,
+        help="Minimum OCR words per row to keep the row for fallback table detection.",
+    )
+    parser.add_argument(
+        "--ocr-table-min-words",
+        type=int,
+        default=18,
+        help="Minimum OCR words on page before attempting fallback table detection.",
+    )
+    parser.add_argument(
+        "--ocr-table-expand",
+        type=float,
+        default=0.01,
+        help="Expand fallback OCR-derived table boxes by this normalized margin.",
+    )
+    parser.add_argument(
         "--disable-table-detector",
         action="store_true",
         help="Skip table detection and rely only on OCR/visual.",
@@ -208,6 +255,43 @@ def expand_box_norm(box: List[float], dx: float, dy: float) -> List[float]:
     if x1 <= x0 or y1 <= y0:
         return box
     return [x0, y0, x1, y1]
+
+
+def box_area(box: List[float]) -> float:
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def iou(a: List[float], b: List[float]) -> float:
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    inter = (x1 - x0) * (y1 - y0)
+    ua = box_area(a) + box_area(b) - inter
+    return inter / ua if ua > 0 else 0.0
+
+
+def merge_boxes(boxes: List[List[float]], iou_thr: float = 0.25) -> List[List[float]]:
+    if not boxes:
+        return []
+    out: List[List[float]] = []
+    for box in boxes:
+        merged = False
+        for j, cur in enumerate(out):
+            if iou(box, cur) >= iou_thr:
+                out[j] = [
+                    min(cur[0], box[0]),
+                    min(cur[1], box[1]),
+                    max(cur[2], box[2]),
+                    max(cur[3], box[3]),
+                ]
+                merged = True
+                break
+        if not merged:
+            out.append(list(box))
+    return out
 
 
 def expand_allowed(allowed: Set[int], grid_size: int, image_token_start: int, radius: int) -> Set[int]:
@@ -331,6 +415,81 @@ def load_ocr_boxes(
                 boxes.append([x0 / width, y0 / height, x1 / width, y1 / height])
             page_boxes[page_id] = boxes
     return page_boxes
+
+
+def infer_table_boxes_from_ocr(
+    boxes: List[List[float]],
+    row_tol: float,
+    col_tol: float,
+    min_rows: int,
+    min_cols: int,
+    min_words_per_row: int,
+    min_words: int,
+    expand: float,
+    min_area_frac: float,
+    max_area_frac: float,
+) -> List[List[float]]:
+    if len(boxes) < max(1, min_words):
+        return []
+
+    words = []
+    for b in boxes:
+        x0, y0, x1, y1 = b
+        if x1 <= x0 or y1 <= y0:
+            continue
+        cx = 0.5 * (x0 + x1)
+        cy = 0.5 * (y0 + y1)
+        words.append((x0, y0, x1, y1, cx, cy))
+    if len(words) < max(1, min_words):
+        return []
+
+    words.sort(key=lambda t: t[5])
+    rows: List[List[Tuple[float, float, float, float, float, float]]] = []
+    for w in words:
+        if not rows:
+            rows.append([w])
+            continue
+        prev_cy = sum(x[5] for x in rows[-1]) / len(rows[-1])
+        if abs(w[5] - prev_cy) <= row_tol:
+            rows[-1].append(w)
+        else:
+            rows.append([w])
+
+    rows = [r for r in rows if len(r) >= max(1, min_words_per_row)]
+    if len(rows) < max(1, min_rows):
+        return []
+
+    row_bins: List[Set[int]] = []
+    for r in rows:
+        bins = {int(round(w[4] / max(col_tol, 1e-6))) for w in r}
+        row_bins.append(bins)
+
+    col_counts = defaultdict(int)
+    for bins in row_bins:
+        for b in bins:
+            col_counts[b] += 1
+    min_col_support = max(2, int(round(0.5 * len(rows))))
+    good_cols = {b for b, c in col_counts.items() if c >= min_col_support}
+    if len(good_cols) < max(1, min_cols):
+        return []
+
+    kept = []
+    for r, bins in zip(rows, row_bins):
+        if len(good_cols.intersection(bins)) < max(1, min_cols):
+            continue
+        kept.extend(r)
+    if len(kept) < max(1, min_words):
+        return []
+
+    x0 = min(w[0] for w in kept)
+    y0 = min(w[1] for w in kept)
+    x1 = max(w[2] for w in kept)
+    y1 = max(w[3] for w in kept)
+    box = expand_box_norm([x0, y0, x1, y1], expand, expand)
+    area = box_area(box)
+    if area < min_area_frac or area > max_area_frac:
+        return []
+    return [box]
 
 
 def load_visual_max_map(path: Optional[Path]) -> Dict[Tuple[str, int], float]:
@@ -486,6 +645,22 @@ def main() -> None:
                 expand_box_norm(box=b, dx=args.table_expand_x, dy=args.table_expand_y)
                 for b in table_boxes
             ]
+        if args.enable_ocr_table_fallback:
+            table_boxes.extend(
+                infer_table_boxes_from_ocr(
+                    boxes=ocr_boxes.get(page_id, []),
+                    row_tol=args.ocr_table_row_tol,
+                    col_tol=args.ocr_table_col_tol,
+                    min_rows=args.ocr_table_min_rows,
+                    min_cols=args.ocr_table_min_cols,
+                    min_words_per_row=args.ocr_table_min_words_per_row,
+                    min_words=args.ocr_table_min_words,
+                    expand=args.ocr_table_expand,
+                    min_area_frac=args.min_table_area_frac,
+                    max_area_frac=args.max_table_area_frac,
+                )
+            )
+        table_boxes = merge_boxes(table_boxes, iou_thr=0.25)
         page_table_boxes[page_id] = table_boxes
 
         text_hits_raw: Set[int] = set()
@@ -607,6 +782,7 @@ def main() -> None:
         "table_detector_enabled": not args.disable_table_detector,
         "table_model_name": args.table_model_name if not args.disable_table_detector else "",
         "table_score_threshold": args.table_score_threshold,
+        "enable_ocr_table_fallback": bool(args.enable_ocr_table_fallback),
         "visual_min_score": args.visual_min_score,
         "counts": dict(counts),
     }
