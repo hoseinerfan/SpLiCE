@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
+    from transformers import AutoImageProcessor, TableTransformerForObjectDetection
+except ImportError:
+    AutoImageProcessor = None
+    TableTransformerForObjectDetection = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create layout-aware patch labels using OCR + table detection with priority:\n"
+            "table_text > table_structure > ocr_text > visual_region."
+        )
+    )
+    parser.add_argument("--labels-jsonl", type=str, required=True, help="Base patch labels JSONL (one doc).")
+    parser.add_argument("--ocr-jsonl", type=str, required=True, help="OCR words JSONL for the same doc.")
+    parser.add_argument("--output-jsonl", type=str, required=True, help="Output JSONL path.")
+    parser.add_argument(
+        "--page-image-template",
+        type=str,
+        required=True,
+        help="Template: /path/{doc_id}_{page_index}.png",
+    )
+    parser.add_argument(
+        "--visual-labels-jsonl",
+        type=str,
+        default="",
+        help="Optional visual labels JSONL for fallback visual_region labeling.",
+    )
+    parser.add_argument(
+        "--visual-min-score",
+        type=float,
+        default=0.20,
+        help="Min max-concept score in visual labels to mark visual_region.",
+    )
+
+    parser.add_argument("--grid-size", type=int, default=32, help="Patch grid size.")
+    parser.add_argument("--image-token-start", type=int, default=0, help="Image token start index.")
+    parser.add_argument("--image-token-count", type=int, default=1024, help="Image token count.")
+    parser.add_argument("--min-word-conf", type=float, default=45.0, help="OCR confidence threshold.")
+    parser.add_argument("--min-overlap-text", type=float, default=0.08, help="Min patch overlap with OCR word box.")
+    parser.add_argument("--min-overlap-table", type=float, default=0.10, help="Min patch overlap with table box.")
+    parser.add_argument(
+        "--text-dilate-cells",
+        type=int,
+        default=1,
+        help="Dilate OCR-hit patch cells by this radius to better cover tables.",
+    )
+
+    parser.add_argument(
+        "--table-model-name",
+        type=str,
+        default="microsoft/table-transformer-detection",
+        help="HF model name for table detection.",
+    )
+    parser.add_argument(
+        "--table-score-threshold",
+        type=float,
+        default=0.85,
+        help="Table detector confidence threshold.",
+    )
+    parser.add_argument(
+        "--disable-table-detector",
+        action="store_true",
+        help="Skip table detection and rely only on OCR/visual.",
+    )
+    default_device = "cpu"
+    if torch is not None and torch.cuda.is_available():
+        default_device = "cuda"
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=default_device,
+        help="Torch device for table detector.",
+    )
+    parser.add_argument("--summary-json", type=str, default="", help="Optional summary JSON output.")
+    parser.add_argument("--summary-tsv", type=str, default="", help="Optional per-page concept count TSV.")
+    return parser.parse_args()
+
+
+def infer_page_id(row: Dict) -> str:
+    page_id = str(row.get("page_id", "")).strip()
+    if page_id:
+        return page_id
+    rid = str(row.get("id", "")).strip()
+    if "#patch" in rid:
+        return rid.split("#patch", 1)[0]
+    return rid
+
+
+def parse_page_components(page_id: str) -> Tuple[str, int]:
+    if ":" not in page_id:
+        raise ValueError(f"Invalid page_id (expected doc:page): {page_id}")
+    doc_id, page_str = page_id.rsplit(":", 1)
+    return doc_id, int(page_str)
+
+
+def patch_bbox(
+    patch_index: int,
+    grid_size: int,
+    image_token_start: int,
+) -> Tuple[int, int, List[float]]:
+    rel = patch_index - image_token_start
+    row = rel // grid_size
+    col = rel % grid_size
+    x0 = col / grid_size
+    y0 = row / grid_size
+    x1 = (col + 1) / grid_size
+    y1 = (row + 1) / grid_size
+    return row, col, [x0, y0, x1, y1]
+
+
+def overlap_fraction_of_patch(a: List[float], b: List[float]) -> float:
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    inter = (x1 - x0) * (y1 - y0)
+    patch_area = (a[2] - a[0]) * (a[3] - a[1])
+    return inter / patch_area if patch_area > 0 else 0.0
+
+
+def expand_allowed(allowed: Set[int], grid_size: int, image_token_start: int, radius: int) -> Set[int]:
+    if radius <= 0 or not allowed:
+        return allowed
+    out: Set[int] = set(allowed)
+    for patch_index in list(allowed):
+        rel = patch_index - image_token_start
+        row = rel // grid_size
+        col = rel % grid_size
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                rr = row + dr
+                cc = col + dc
+                if 0 <= rr < grid_size and 0 <= cc < grid_size:
+                    out.add(image_token_start + rr * grid_size + cc)
+    return out
+
+
+def load_rows(path: Path) -> List[Dict]:
+    rows: List[Dict] = []
+    with open(path, "r") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def load_ocr_boxes(ocr_jsonl: Path, min_conf: float) -> Dict[str, List[List[float]]]:
+    page_boxes: Dict[str, List[List[float]]] = {}
+    with open(ocr_jsonl, "r") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            page_id = str(row.get("page_id", "")).strip()
+            if not page_id:
+                continue
+            width = float(row.get("width", 0) or 0)
+            height = float(row.get("height", 0) or 0)
+            boxes: List[List[float]] = []
+            for word in row.get("words", []):
+                if not isinstance(word, dict):
+                    continue
+                conf = float(word.get("conf", -1.0))
+                if conf < min_conf:
+                    continue
+                box = word.get("bbox_xyxy", [])
+                if not isinstance(box, list) or len(box) != 4:
+                    continue
+                if width <= 0 or height <= 0:
+                    continue
+                x0, y0, x1, y1 = [float(v) for v in box]
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                boxes.append([x0 / width, y0 / height, x1 / width, y1 / height])
+            page_boxes[page_id] = boxes
+    return page_boxes
+
+
+def load_visual_max_map(path: Optional[Path]) -> Dict[Tuple[str, int], float]:
+    if path is None:
+        return {}
+    out: Dict[Tuple[str, int], float] = {}
+    with open(path, "r") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            page_id = infer_page_id(row)
+            if not page_id:
+                continue
+            patch_index = int(row.get("patch_index", -1))
+            if patch_index < 0:
+                continue
+            mx = 0.0
+            for item in row.get("top_concepts", []):
+                try:
+                    w = float(item.get("weight", 0.0))
+                except Exception:
+                    w = 0.0
+                if w > mx:
+                    mx = w
+            out[(page_id, patch_index)] = mx
+    return out
+
+
+class TableDetector:
+    def __init__(self, model_name: str, device: str, score_thr: float) -> None:
+        if torch is None:
+            raise RuntimeError("torch is required for table detection. Install with: pip install torch")
+        if Image is None:
+            raise RuntimeError("Pillow is required. Install with: pip install pillow")
+        if AutoImageProcessor is None or TableTransformerForObjectDetection is None:
+            raise RuntimeError(
+                "transformers is required for table detection. Install with: pip install transformers"
+            )
+        self.score_thr = score_thr
+        self.device = torch.device(device)
+        self.processor = AutoImageProcessor.from_pretrained(model_name)
+        self.model = TableTransformerForObjectDetection.from_pretrained(model_name).to(self.device)
+        self.model.eval()
+        self.id2label = {int(k): str(v).lower() for k, v in self.model.config.id2label.items()}
+
+    def detect_normalized_boxes(self, image_path: Path) -> List[List[float]]:
+        image = Image.open(image_path).convert("RGB")
+        w, h = image.size
+        if w <= 0 or h <= 0:
+            return []
+
+        inputs = self.processor(images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+
+        target_sizes = torch.tensor([[h, w]], device=self.device)
+        processed = self.processor.post_process_object_detection(
+            outputs=outputs,
+            target_sizes=target_sizes,
+            threshold=self.score_thr,
+        )[0]
+
+        boxes: List[List[float]] = []
+        scores = processed["scores"].detach().cpu().tolist()
+        labels = processed["labels"].detach().cpu().tolist()
+        bboxes = processed["boxes"].detach().cpu().tolist()
+        for score, label_id, box in zip(scores, labels, bboxes):
+            label = self.id2label.get(int(label_id), "")
+            if "table" not in label:
+                continue
+            x0, y0, x1, y1 = [float(v) for v in box]
+            x0 = max(0.0, min(float(w), x0))
+            y0 = max(0.0, min(float(h), y0))
+            x1 = max(0.0, min(float(w), x1))
+            y1 = max(0.0, min(float(h), y1))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            boxes.append([x0 / w, y0 / h, x1 / w, y1 / h])
+        return boxes
+
+
+def main() -> None:
+    args = parse_args()
+    if torch is None:
+        raise RuntimeError("torch is required. Run in the splice environment with torch installed.")
+    labels_path = Path(args.labels_jsonl)
+    ocr_path = Path(args.ocr_jsonl)
+    out_path = Path(args.output_jsonl)
+    vis_path = Path(args.visual_labels_jsonl) if args.visual_labels_jsonl else None
+
+    if not labels_path.is_file():
+        raise FileNotFoundError(f"labels-jsonl not found: {labels_path}")
+    if not ocr_path.is_file():
+        raise FileNotFoundError(f"ocr-jsonl not found: {ocr_path}")
+    if vis_path is not None and not vis_path.is_file():
+        raise FileNotFoundError(f"visual-labels-jsonl not found: {vis_path}")
+    if args.image_token_count != args.grid_size * args.grid_size:
+        raise ValueError("--image-token-count must equal grid-size^2 for this script.")
+
+    rows = load_rows(labels_path)
+    page_ids = sorted({infer_page_id(r) for r in rows if infer_page_id(r)})
+    if not page_ids:
+        raise ValueError(f"No page rows found in {labels_path}")
+
+    ocr_boxes = load_ocr_boxes(ocr_path, min_conf=args.min_word_conf)
+    visual_max = load_visual_max_map(vis_path)
+
+    detector: Optional[TableDetector] = None
+    if not args.disable_table_detector:
+        detector = TableDetector(
+            model_name=args.table_model_name,
+            device=args.device,
+            score_thr=args.table_score_threshold,
+        )
+
+    page_text_hits: Dict[str, Set[int]] = {}
+    page_table_hits: Dict[str, Set[int]] = {}
+    page_table_boxes: Dict[str, List[List[float]]] = {}
+
+    for page_id in page_ids:
+        doc_id, page_index = parse_page_components(page_id)
+        image_path = Path(args.page_image_template.format(doc_id=doc_id, page_index=page_index))
+        if not image_path.is_file():
+            raise FileNotFoundError(f"Missing page image: {image_path}")
+
+        table_boxes = detector.detect_normalized_boxes(image_path) if detector else []
+        page_table_boxes[page_id] = table_boxes
+
+        text_hits: Set[int] = set()
+        table_hits: Set[int] = set()
+
+        for patch_index in range(args.image_token_start, args.image_token_start + args.image_token_count):
+            _, _, pb = patch_bbox(
+                patch_index=patch_index,
+                grid_size=args.grid_size,
+                image_token_start=args.image_token_start,
+            )
+
+            for box in ocr_boxes.get(page_id, []):
+                if overlap_fraction_of_patch(pb, box) >= args.min_overlap_text:
+                    text_hits.add(patch_index)
+                    break
+
+            for box in table_boxes:
+                if overlap_fraction_of_patch(pb, box) >= args.min_overlap_table:
+                    table_hits.add(patch_index)
+                    break
+
+        if args.text_dilate_cells > 0:
+            text_hits = expand_allowed(
+                allowed=text_hits,
+                grid_size=args.grid_size,
+                image_token_start=args.image_token_start,
+                radius=args.text_dilate_cells,
+            )
+
+        page_text_hits[page_id] = text_hits
+        page_table_hits[page_id] = table_hits
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    total_rows = 0
+    counts = defaultdict(int)
+    per_page = defaultdict(lambda: defaultdict(int))
+
+    with open(out_path, "w") as out:
+        for row in rows:
+            page_id = infer_page_id(row)
+            patch_index = int(row.get("patch_index", -1))
+            labels: List[Dict] = []
+
+            in_image_range = (
+                patch_index >= args.image_token_start
+                and patch_index < (args.image_token_start + args.image_token_count)
+            )
+            if in_image_range and page_id:
+                in_text = patch_index in page_text_hits.get(page_id, set())
+                in_table = patch_index in page_table_hits.get(page_id, set())
+                vis_score = float(visual_max.get((page_id, patch_index), 0.0))
+
+                if in_table and in_text:
+                    labels = [{"concept": "table_text", "weight": 1.0}]
+                    counts["table_text"] += 1
+                    per_page[page_id]["table_text"] += 1
+                elif in_table:
+                    labels = [{"concept": "table_structure", "weight": 1.0}]
+                    counts["table_structure"] += 1
+                    per_page[page_id]["table_structure"] += 1
+                elif in_text:
+                    labels = [{"concept": "ocr_text", "weight": 1.0}]
+                    counts["ocr_text"] += 1
+                    per_page[page_id]["ocr_text"] += 1
+                elif vis_score >= args.visual_min_score:
+                    labels = [{"concept": "visual_region", "weight": round(vis_score, 6)}]
+                    counts["visual_region"] += 1
+                    per_page[page_id]["visual_region"] += 1
+                else:
+                    counts["unlabeled"] += 1
+                    per_page[page_id]["unlabeled"] += 1
+            else:
+                counts["out_of_image_range"] += 1
+                per_page[page_id]["out_of_image_range"] += 1
+
+            row["top_concepts"] = labels
+            out.write(json.dumps(row) + "\n")
+            total_rows += 1
+
+    summary = {
+        "labels_jsonl": str(labels_path),
+        "ocr_jsonl": str(ocr_path),
+        "visual_labels_jsonl": str(vis_path) if vis_path else "",
+        "output_jsonl": str(out_path),
+        "pages": len(page_ids),
+        "rows": total_rows,
+        "grid_size": args.grid_size,
+        "image_token_start": args.image_token_start,
+        "image_token_count": args.image_token_count,
+        "table_detector_enabled": not args.disable_table_detector,
+        "table_model_name": args.table_model_name if not args.disable_table_detector else "",
+        "table_score_threshold": args.table_score_threshold,
+        "visual_min_score": args.visual_min_score,
+        "counts": dict(counts),
+    }
+
+    print("=== Layout Label Summary ===")
+    print(json.dumps(summary, indent=2))
+
+    if args.summary_json:
+        p = Path(args.summary_json)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as handle:
+            json.dump(summary, handle, indent=2)
+            handle.write("\n")
+        print(f"Wrote: {p}")
+
+    if args.summary_tsv:
+        p = Path(args.summary_tsv)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as handle:
+            handle.write("page_id\tocr_text\ttable_text\ttable_structure\tvisual_region\tunlabeled\n")
+            for page_id in page_ids:
+                rec = per_page[page_id]
+                handle.write(
+                    f"{page_id}\t"
+                    f"{int(rec.get('ocr_text', 0))}\t"
+                    f"{int(rec.get('table_text', 0))}\t"
+                    f"{int(rec.get('table_structure', 0))}\t"
+                    f"{int(rec.get('visual_region', 0))}\t"
+                    f"{int(rec.get('unlabeled', 0))}\n"
+                )
+        print(f"Wrote: {p}")
+
+
+if __name__ == "__main__":
+    main()
