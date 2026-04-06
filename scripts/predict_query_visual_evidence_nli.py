@@ -86,6 +86,16 @@ def parse_args() -> argparse.Namespace:
         help="When supports are exactly tied in --binary-only mode, pick this class.",
     )
     parser.add_argument(
+        "--score-mode",
+        type=str,
+        default="entailment_minus_contradiction",
+        choices=["entailment", "entailment_minus_contradiction"],
+        help=(
+            "How to convert NLI outputs into support values used for decision. "
+            "'entailment_minus_contradiction' is usually more stable."
+        ),
+    )
+    parser.add_argument(
         "--max-rows",
         type=int,
         default=0,
@@ -215,6 +225,14 @@ def decide_label(
     return "uncertain"
 
 
+def support_from_scores(scores: Dict[str, float], mode: str) -> float:
+    if mode == "entailment":
+        return float(scores.get("entailment", 0.0))
+    contradiction = float(scores.get("contradiction", 0.0))
+    entailment = float(scores.get("entailment", 0.0))
+    return entailment - contradiction
+
+
 def main() -> None:
     args = parse_args()
     queries = read_queries(args)
@@ -259,8 +277,8 @@ def main() -> None:
                 args.text_hypothesis,
             )
 
-            visual_support = visual_scores["entailment"]
-            text_support = text_scores["entailment"]
+            visual_support = support_from_scores(visual_scores, args.score_mode)
+            text_support = support_from_scores(text_scores, args.score_mode)
             margin = visual_support - text_support
             label = decide_label(
                 visual_support=visual_support,
@@ -280,6 +298,10 @@ def main() -> None:
                 "visual_support": round(visual_support, 6),
                 "text_support": round(text_support, 6),
                 "margin_visual_minus_text": round(margin, 6),
+                "visual_entailment": round(visual_scores.get("entailment", 0.0), 6),
+                "text_entailment": round(text_scores.get("entailment", 0.0), 6),
+                "visual_contradiction": round(visual_scores.get("contradiction", 0.0), 6),
+                "text_contradiction": round(text_scores.get("contradiction", 0.0), 6),
                 "visual_hypothesis": args.visual_hypothesis,
                 "text_hypothesis": args.text_hypothesis,
                 "visual_scores": {k: round(v, 6) for k, v in visual_scores.items()},
@@ -288,6 +310,7 @@ def main() -> None:
                 "min_margin": args.min_margin,
                 "binary_only": args.binary_only,
                 "binary_tie_break": args.binary_tie_break,
+                "score_mode": args.score_mode,
                 "model_name": args.model_name,
             }
             fout.write(json.dumps(out_row, ensure_ascii=False) + "\n")
