@@ -74,6 +74,18 @@ def parse_args() -> argparse.Namespace:
         help="Minimum absolute support gap between visual/text hypotheses.",
     )
     parser.add_argument(
+        "--binary-only",
+        action="store_true",
+        help="Force binary decision with no 'uncertain' output.",
+    )
+    parser.add_argument(
+        "--binary-tie-break",
+        type=str,
+        default="visual",
+        choices=["visual", "text"],
+        help="When supports are exactly tied in --binary-only mode, pick this class.",
+    )
+    parser.add_argument(
         "--max-rows",
         type=int,
         default=0,
@@ -185,7 +197,16 @@ def decide_label(
     text_support: float,
     min_support: float,
     min_margin: float,
+    binary_only: bool,
+    binary_tie_break: str,
 ) -> str:
+    if binary_only:
+        if visual_support > text_support:
+            return "needs_visual"
+        if text_support > visual_support:
+            return "text_only"
+        return "needs_visual" if binary_tie_break == "visual" else "text_only"
+
     margin = visual_support - text_support
     if visual_support >= min_support and margin >= min_margin:
         return "needs_visual"
@@ -241,13 +262,21 @@ def main() -> None:
             visual_support = visual_scores["entailment"]
             text_support = text_scores["entailment"]
             margin = visual_support - text_support
-            label = decide_label(visual_support, text_support, args.min_support, args.min_margin)
+            label = decide_label(
+                visual_support=visual_support,
+                text_support=text_support,
+                min_support=args.min_support,
+                min_margin=args.min_margin,
+                binary_only=args.binary_only,
+                binary_tie_break=args.binary_tie_break,
+            )
             counts[label] += 1
 
             out_row = {
                 "query_id": qid,
                 "query_text": qtext,
                 "label": label,
+                "needs_visual_evidence": (label == "needs_visual"),
                 "visual_support": round(visual_support, 6),
                 "text_support": round(text_support, 6),
                 "margin_visual_minus_text": round(margin, 6),
@@ -257,6 +286,8 @@ def main() -> None:
                 "text_scores": {k: round(v, 6) for k, v in text_scores.items()},
                 "min_support": args.min_support,
                 "min_margin": args.min_margin,
+                "binary_only": args.binary_only,
+                "binary_tie_break": args.binary_tie_break,
                 "model_name": args.model_name,
             }
             fout.write(json.dumps(out_row, ensure_ascii=False) + "\n")
