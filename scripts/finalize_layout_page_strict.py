@@ -151,6 +151,34 @@ def parse_args() -> argparse.Namespace:
         help="Maximum bbox area fraction allowed for component rectangle fill.",
     )
     p.add_argument(
+        "--rectangularize-selected-regions",
+        action="store_true",
+        help=(
+            "Force selected class regions (table_all / ocr_text / image_region) to "
+            "solid rectangular components by filling each connected component bbox."
+        ),
+    )
+    p.add_argument(
+        "--rectangularize-min-cells",
+        type=int,
+        default=1,
+        help="Minimum cells in a class component to apply rectangularization.",
+    )
+    p.add_argument(
+        "--rectangularize-max-area-frac",
+        type=float,
+        default=1.0,
+        help="Maximum bbox area fraction allowed during class rectangularization.",
+    )
+    p.add_argument(
+        "--assign-background-class",
+        action="store_true",
+        help=(
+            "If set, patches with no selected class get top_concepts=[background]. "
+            "Default behavior leaves them unlabeled (no background class)."
+        ),
+    )
+    p.add_argument(
         "--summary-json",
         type=str,
         default="",
@@ -639,6 +667,7 @@ def main() -> None:
 
     # Derive table cells robustly: structure seeds + nearby table_text.
     table_cells: Set[Tuple[int, int]] = set(page_structure_cells)
+    ocr_cells: Set[Tuple[int, int]] = set(page_ocr_cells)
     if page_structure_cells:
         expanded = dilate_cells(
             cells=page_structure_cells,
@@ -691,6 +720,34 @@ def main() -> None:
         )
         table_cells |= comp_rect_filled
 
+    if args.rectangularize_selected_regions:
+        min_cells = int(args.rectangularize_min_cells)
+        max_area_frac = float(args.rectangularize_max_area_frac)
+        if image_cells:
+            image_cells |= rect_fill_from_components(
+                source_cells=image_cells,
+                grid_size=args.grid_size,
+                min_component_cells=min_cells,
+                max_area_frac=max_area_frac,
+                blocked=set(),
+            )
+        if table_cells:
+            table_cells |= rect_fill_from_components(
+                source_cells=table_cells,
+                grid_size=args.grid_size,
+                min_component_cells=min_cells,
+                max_area_frac=max_area_frac,
+                blocked=set(),
+            )
+        if ocr_cells:
+            ocr_cells |= rect_fill_from_components(
+                source_cells=ocr_cells,
+                grid_size=args.grid_size,
+                min_component_cells=min_cells,
+                max_area_frac=max_area_frac,
+                blocked=set(),
+            )
+
     print(
         "table derivation -> "
         f"structure: {len(page_structure_cells)} "
@@ -706,6 +763,8 @@ def main() -> None:
         "ocr_text": set(),
         "image_region": set(),
     }
+    if args.assign_background_class:
+        concept_cells["background"] = set()
 
     with open(out_path, "w") as g:
         for row in rows:
@@ -727,6 +786,7 @@ def main() -> None:
 
                 in_image = False
                 in_table = False
+                in_ocr = False
                 rr = cc = -1
                 if (
                     patch_index >= args.image_token_start
@@ -739,6 +799,7 @@ def main() -> None:
                     )
                     in_image = (rr, cc) in image_cells
                     in_table = (rr, cc) in table_cells
+                    in_ocr = (rr, cc) in ocr_cells
 
                 # Strict precedence: image only removes OCR on the same patch.
                 if in_image:
@@ -746,7 +807,9 @@ def main() -> None:
 
                 table_w = 0.0
                 if in_table:
-                    table_w = max(struct_w, table_text_w)
+                    table_w = max(struct_w, table_text_w, 1.0)
+                if in_ocr and ocr_w <= 0.0:
+                    ocr_w = 1.0
 
                 new_tc: List[Dict] = []
                 if table_w > 0:
@@ -763,6 +826,11 @@ def main() -> None:
                     new_tc.append({"concept": "image_region", "weight": 1.0})
                     counts["image_region"] += 1
                     concept_cells["image_region"].add((rr, cc))
+                if args.assign_background_class and not new_tc:
+                    new_tc.append({"concept": "background", "weight": 1.0})
+                    counts["background"] += 1
+                    if rr >= 0:
+                        concept_cells["background"].add((rr, cc))
 
                 row["top_concepts"] = new_tc
 
@@ -800,6 +868,10 @@ def main() -> None:
         "table_component_rect_fill": bool(args.table_component_rect_fill),
         "table_component_rect_min_cells": int(args.table_component_rect_min_cells),
         "table_component_rect_max_area_frac": float(args.table_component_rect_max_area_frac),
+        "rectangularize_selected_regions": bool(args.rectangularize_selected_regions),
+        "rectangularize_min_cells": int(args.rectangularize_min_cells),
+        "rectangularize_max_area_frac": float(args.rectangularize_max_area_frac),
+        "assign_background_class": bool(args.assign_background_class),
         "pdf_image_boxes": image_boxes,
         "image_derivation": {
             "pdf_cells": len(image_cells_pdf),
@@ -815,6 +887,7 @@ def main() -> None:
             "image_region": int(counts["image_region"]),
             "ocr_text": int(counts["ocr_text"]),
             "table_all": int(counts["table_all"]),
+            "background": int(counts["background"]),
         },
     }
 

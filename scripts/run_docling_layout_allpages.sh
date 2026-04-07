@@ -26,6 +26,9 @@ Optional:
   --docling-device cpu
   --docling-page-number-base one
   --image-source docling
+  --rectangularize-selected-regions
+  --rectangularize-min-cells 1
+  --rectangularize-max-area-frac 1.0
   --skip-missing
   --no-include-visual-region
 EOF
@@ -62,6 +65,9 @@ TABLE_RECT_FILL_MIN_STRUCTURE_CELLS="25"
 TABLE_RECT_FILL_MAX_AREA_FRAC="0.60"
 TABLE_COMPONENT_RECT_MIN_CELLS="40"
 TABLE_COMPONENT_RECT_MAX_AREA_FRAC="0.60"
+RECTANGULARIZE_SELECTED_REGIONS=0
+RECTANGULARIZE_MIN_CELLS="1"
+RECTANGULARIZE_MAX_AREA_FRAC="1.0"
 
 SKIP_MISSING=0
 
@@ -75,6 +81,9 @@ while [[ $# -gt 0 ]]; do
     --docling-device) DOCLING_DEVICE="$2"; shift 2 ;;
     --docling-page-number-base) DOCLING_PAGE_NUMBER_BASE="$2"; shift 2 ;;
     --image-source) IMAGE_SOURCE="$2"; shift 2 ;;
+    --rectangularize-selected-regions) RECTANGULARIZE_SELECTED_REGIONS=1; shift ;;
+    --rectangularize-min-cells) RECTANGULARIZE_MIN_CELLS="$2"; shift 2 ;;
+    --rectangularize-max-area-frac) RECTANGULARIZE_MAX_AREA_FRAC="$2"; shift 2 ;;
     --skip-missing) SKIP_MISSING=1; shift ;;
     --no-include-visual-region) INCLUDE_VISUAL_REGION=0; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -212,6 +221,13 @@ PY
       --overlay-image "${IMG}"
       --overlay-output "${OUTDIR}/${DOC}_page${PAGE_IDX}_overlay_tfill.png"
     )
+    if [[ "${RECTANGULARIZE_SELECTED_REGIONS}" -eq 1 ]]; then
+      FIN_CMD+=(
+        --rectangularize-selected-regions
+        --rectangularize-min-cells "${RECTANGULARIZE_MIN_CELLS}"
+        --rectangularize-max-area-frac "${RECTANGULARIZE_MAX_AREA_FRAC}"
+      )
+    fi
     echo "+ ${FIN_CMD[*]}"
     "${FIN_CMD[@]}"
   done
