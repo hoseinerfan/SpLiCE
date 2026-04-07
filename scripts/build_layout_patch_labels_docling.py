@@ -114,6 +114,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="On accelerator failure, retry conversion on CPU.",
     )
+    p.add_argument(
+        "--docling-page-number-base",
+        type=str,
+        default="auto",
+        choices=["auto", "zero", "one"],
+        help=(
+            "Interpret Docling page_no numbering. "
+            "'zero' means page_no is 0-based, 'one' means 1-based, 'auto' infers from document."
+        ),
+    )
     return p.parse_args()
 
 
@@ -292,17 +302,14 @@ def load_page_sizes_from_pdf(pdf_path: Path) -> Dict[int, Tuple[float, float]]:
     return out
 
 
-def resolve_page_index(raw_page_no: Any, valid_page_indices: Set[int]) -> Optional[int]:
+def resolve_page_index(raw_page_no: Any, valid_page_indices: Set[int], page_offset: int) -> Optional[int]:
     f = safe_float(raw_page_no)
     if f is None:
         return None
     v = int(f)
-    if v in valid_page_indices:
-        return v
-    if (v - 1) in valid_page_indices:
-        return v - 1
-    if (v + 1) in valid_page_indices:
-        return v + 1
+    v2 = v + int(page_offset)
+    if v2 in valid_page_indices:
+        return v2
     return None
 
 
@@ -334,6 +341,46 @@ def iter_docling_items(doc: Any) -> Iterable[Any]:
         if isinstance(val, list):
             for x in val:
                 yield x
+
+
+def infer_docling_page_offset(
+    doc: Any,
+    valid_page_indices: Set[int],
+    mode: str,
+) -> Tuple[int, List[int]]:
+    if mode == "zero":
+        return 0, []
+    if mode == "one":
+        return -1, []
+
+    observed: List[int] = []
+    for item in iter_docling_items(doc):
+        prov_list = list(iter_item_provenances(item))
+        if not prov_list:
+            prov_list = [item]
+        for prov in prov_list:
+            raw_page_no = get_attr_or_key(prov, "page_no", None)
+            if raw_page_no is None:
+                raw_page_no = get_attr_or_key(item, "page_no", None)
+            f = safe_float(raw_page_no)
+            if f is None:
+                continue
+            observed.append(int(f))
+
+    if not observed:
+        return 0, observed
+
+    score_zero = sum(1 for v in observed if v in valid_page_indices)
+    score_one = sum(1 for v in observed if (v - 1) in valid_page_indices)
+
+    if score_one > score_zero:
+        return -1, observed
+    if score_one == score_zero:
+        if 0 in observed:
+            return 0, observed
+        if min(observed) >= 1:
+            return -1, observed
+    return 0, observed
 
 
 def build_docling_converter(
@@ -426,6 +473,7 @@ def extract_docling_zone_boxes(
     doc: Any,
     page_sizes: Dict[int, Tuple[float, float]],
     valid_page_indices: Set[int],
+    page_offset: int,
 ) -> Tuple[Dict[int, List[List[float]]], Dict[int, List[List[float]]], Dict[int, List[List[float]]], List[Dict[str, Any]]]:
     page_text_boxes: Dict[int, List[List[float]]] = defaultdict(list)
     page_table_boxes: Dict[int, List[List[float]]] = defaultdict(list)
@@ -451,7 +499,7 @@ def extract_docling_zone_boxes(
             raw_page_no = get_attr_or_key(prov, "page_no", None)
             if raw_page_no is None:
                 raw_page_no = get_attr_or_key(item, "page_no", None)
-            page_index = resolve_page_index(raw_page_no, valid_page_indices)
+            page_index = resolve_page_index(raw_page_no, valid_page_indices, page_offset=page_offset)
             if page_index is None:
                 continue
 
@@ -544,10 +592,16 @@ def main() -> None:
         do_table_structure=args.docling_do_table_structure,
         fallback_to_cpu=args.docling_fallback_to_cpu,
     )
+    page_offset, observed_page_numbers = infer_docling_page_offset(
+        doc=doc,
+        valid_page_indices=valid_page_indices,
+        mode=args.docling_page_number_base,
+    )
     page_text_boxes, page_table_boxes, page_visual_boxes, debug_rows = extract_docling_zone_boxes(
         doc=doc,
         page_sizes=page_sizes,
         valid_page_indices=valid_page_indices,
+        page_offset=page_offset,
     )
 
     page_text_hits: Dict[str, Set[int]] = {}
@@ -656,6 +710,13 @@ def main() -> None:
         "docling_do_ocr": bool(args.docling_do_ocr),
         "docling_do_table_structure": bool(args.docling_do_table_structure),
         "docling_fallback_to_cpu": bool(args.docling_fallback_to_cpu),
+        "docling_page_number_base": args.docling_page_number_base,
+        "docling_page_offset_used": int(page_offset),
+        "docling_observed_page_numbers_minmax": (
+            [int(min(observed_page_numbers)), int(max(observed_page_numbers))]
+            if observed_page_numbers
+            else []
+        ),
         "docling_zone_counts": {
             "text_boxes_total": int(sum(len(v) for v in page_text_boxes.values())),
             "table_boxes_total": int(sum(len(v) for v in page_table_boxes.values())),
