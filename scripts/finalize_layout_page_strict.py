@@ -152,10 +152,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--rectangularize-selected-regions",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Force selected class regions (table_all / ocr_text / image_region) to "
-            "solid rectangular components by filling each connected component bbox."
+            "solid rectangular components by filling each connected component bbox. "
+            "Default: enabled."
         ),
     )
     p.add_argument(

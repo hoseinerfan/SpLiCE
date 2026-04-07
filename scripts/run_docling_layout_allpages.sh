@@ -27,6 +27,7 @@ Optional:
   --docling-page-number-base one
   --image-source docling
   --rectangularize-selected-regions
+  --no-rectangularize-selected-regions
   --rectangularize-min-cells 1
   --rectangularize-max-area-frac 1.0
   --skip-missing
@@ -65,7 +66,7 @@ TABLE_RECT_FILL_MIN_STRUCTURE_CELLS="25"
 TABLE_RECT_FILL_MAX_AREA_FRAC="0.60"
 TABLE_COMPONENT_RECT_MIN_CELLS="40"
 TABLE_COMPONENT_RECT_MAX_AREA_FRAC="0.60"
-RECTANGULARIZE_SELECTED_REGIONS=0
+RECTANGULARIZE_SELECTED_REGIONS=1
 RECTANGULARIZE_MIN_CELLS="1"
 RECTANGULARIZE_MAX_AREA_FRAC="1.0"
 
@@ -82,6 +83,7 @@ while [[ $# -gt 0 ]]; do
     --docling-page-number-base) DOCLING_PAGE_NUMBER_BASE="$2"; shift 2 ;;
     --image-source) IMAGE_SOURCE="$2"; shift 2 ;;
     --rectangularize-selected-regions) RECTANGULARIZE_SELECTED_REGIONS=1; shift ;;
+    --no-rectangularize-selected-regions) RECTANGULARIZE_SELECTED_REGIONS=0; shift ;;
     --rectangularize-min-cells) RECTANGULARIZE_MIN_CELLS="$2"; shift 2 ;;
     --rectangularize-max-area-frac) RECTANGULARIZE_MAX_AREA_FRAC="$2"; shift 2 ;;
     --skip-missing) SKIP_MISSING=1; shift ;;
@@ -227,6 +229,8 @@ PY
         --rectangularize-min-cells "${RECTANGULARIZE_MIN_CELLS}"
         --rectangularize-max-area-frac "${RECTANGULARIZE_MAX_AREA_FRAC}"
       )
+    else
+      FIN_CMD+=(--no-rectangularize-selected-regions)
     fi
     echo "+ ${FIN_CMD[*]}"
     "${FIN_CMD[@]}"
