@@ -96,6 +96,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--calibrated-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Optional calibrated threshold on margin_visual_minus_text. "
+            "If set, decision becomes strict binary: "
+            "needs_visual if margin >= threshold else text_only."
+        ),
+    )
+    parser.add_argument(
         "--max-rows",
         type=int,
         default=0,
@@ -280,14 +290,17 @@ def main() -> None:
             visual_support = support_from_scores(visual_scores, args.score_mode)
             text_support = support_from_scores(text_scores, args.score_mode)
             margin = visual_support - text_support
-            label = decide_label(
-                visual_support=visual_support,
-                text_support=text_support,
-                min_support=args.min_support,
-                min_margin=args.min_margin,
-                binary_only=args.binary_only,
-                binary_tie_break=args.binary_tie_break,
-            )
+            if args.calibrated_threshold is not None:
+                label = "needs_visual" if margin >= args.calibrated_threshold else "text_only"
+            else:
+                label = decide_label(
+                    visual_support=visual_support,
+                    text_support=text_support,
+                    min_support=args.min_support,
+                    min_margin=args.min_margin,
+                    binary_only=args.binary_only,
+                    binary_tie_break=args.binary_tie_break,
+                )
             counts[label] += 1
 
             out_row = {
@@ -311,6 +324,8 @@ def main() -> None:
                 "binary_only": args.binary_only,
                 "binary_tie_break": args.binary_tie_break,
                 "score_mode": args.score_mode,
+                "calibrated_threshold": args.calibrated_threshold,
+                "calibrated_decision_used": args.calibrated_threshold is not None,
                 "model_name": args.model_name,
             }
             fout.write(json.dumps(out_row, ensure_ascii=False) + "\n")
