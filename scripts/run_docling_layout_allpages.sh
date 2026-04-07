@@ -30,6 +30,8 @@ Optional:
   --no-rectangularize-selected-regions
   --rectangularize-min-cells 1
   --rectangularize-max-area-frac 1.0
+  --assign-background-class
+  --no-assign-background-class
   --skip-missing
   --no-include-visual-region
 EOF
@@ -69,6 +71,7 @@ TABLE_COMPONENT_RECT_MAX_AREA_FRAC="0.60"
 RECTANGULARIZE_SELECTED_REGIONS=1
 RECTANGULARIZE_MIN_CELLS="1"
 RECTANGULARIZE_MAX_AREA_FRAC="1.0"
+ASSIGN_BACKGROUND_CLASS=0
 
 SKIP_MISSING=0
 
@@ -86,6 +89,8 @@ while [[ $# -gt 0 ]]; do
     --no-rectangularize-selected-regions) RECTANGULARIZE_SELECTED_REGIONS=0; shift ;;
     --rectangularize-min-cells) RECTANGULARIZE_MIN_CELLS="$2"; shift 2 ;;
     --rectangularize-max-area-frac) RECTANGULARIZE_MAX_AREA_FRAC="$2"; shift 2 ;;
+    --assign-background-class) ASSIGN_BACKGROUND_CLASS=1; shift ;;
+    --no-assign-background-class) ASSIGN_BACKGROUND_CLASS=0; shift ;;
     --skip-missing) SKIP_MISSING=1; shift ;;
     --no-include-visual-region) INCLUDE_VISUAL_REGION=0; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -231,6 +236,9 @@ PY
       )
     else
       FIN_CMD+=(--no-rectangularize-selected-regions)
+    fi
+    if [[ "${ASSIGN_BACKGROUND_CLASS}" -eq 1 ]]; then
+      FIN_CMD+=(--assign-background-class)
     fi
     echo "+ ${FIN_CMD[*]}"
     "${FIN_CMD[@]}"
