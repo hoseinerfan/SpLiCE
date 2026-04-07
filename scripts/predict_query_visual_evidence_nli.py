@@ -11,6 +11,9 @@ DEFAULT_VISUAL_HYPOTHESIS = (
 DEFAULT_TEXT_HYPOTHESIS = (
     "Answering this question can be done from text alone without looking at the document image."
 )
+MMQA_V1_VISUAL_HYPOTHESIS = "To answer this question, visual evidence is needed."
+MMQA_V1_TEXT_HYPOTHESIS = "To answer this question, visual evidence is not needed."
+MMQA_V1_THRESHOLD = 1.0131045
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +28,17 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="cross-encoder/nli-deberta-v3-base",
         help="HF model id or local model directory for sequence classification.",
+    )
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="none",
+        choices=["none", "mmqa_calibrated_v1"],
+        help=(
+            "Optional preset for routing configuration. "
+            "'mmqa_calibrated_v1' uses MMQA-calibrated hypotheses, "
+            "score_mode=entailment_minus_contradiction, and threshold=1.0131045."
+        ),
     )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument(
@@ -245,6 +259,11 @@ def support_from_scores(scores: Dict[str, float], mode: str) -> float:
 
 def main() -> None:
     args = parse_args()
+    if args.preset == "mmqa_calibrated_v1":
+        args.visual_hypothesis = MMQA_V1_VISUAL_HYPOTHESIS
+        args.text_hypothesis = MMQA_V1_TEXT_HYPOTHESIS
+        args.score_mode = "entailment_minus_contradiction"
+        args.calibrated_threshold = MMQA_V1_THRESHOLD
     queries = read_queries(args)
     if not queries:
         raise ValueError("No valid queries found.")
@@ -326,6 +345,7 @@ def main() -> None:
                 "score_mode": args.score_mode,
                 "calibrated_threshold": args.calibrated_threshold,
                 "calibrated_decision_used": args.calibrated_threshold is not None,
+                "preset": args.preset,
                 "model_name": args.model_name,
             }
             fout.write(json.dumps(out_row, ensure_ascii=False) + "\n")
