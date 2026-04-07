@@ -246,6 +246,7 @@ def evaluate(
         labels = batch["labels"].to(device)
         qids = batch.pop("query_id")
         qtexts = batch.pop("query_text")
+        batch.pop("labels")
         batch = {k: v.to(device) for k, v in batch.items()}
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16):
@@ -305,6 +306,7 @@ def train_one_epoch(
         labels = batch["labels"].to(device)
         batch.pop("query_id")
         batch.pop("query_text")
+        batch.pop("labels")
         batch = {k: v.to(device) for k, v in batch.items()}
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16):
