@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Finalize labels for one page with strict layout policy: "
             "table_text/table_structure->table_all, "
-            "image_region from PDF image boxes, "
+            "image_region from configurable source (PDF/Docling/hybrid), "
             "and remove ocr_text only on image patches."
         )
     )
@@ -45,6 +45,26 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.12,
         help="Used only with overlap_or_center mode.",
+    )
+    p.add_argument(
+        "--image-source",
+        type=str,
+        default="pdf",
+        choices=["pdf", "docling", "hybrid"],
+        help=(
+            "Source for image_region: "
+            "'pdf' uses PDF image boxes only; "
+            "'docling' uses visual_region/image_region labels in --labels-jsonl; "
+            "'hybrid' uses PDF if available, otherwise Docling labels."
+        ),
+    )
+    p.add_argument(
+        "--image-hybrid-union",
+        action="store_true",
+        help=(
+            "Only for image-source=hybrid: union PDF and Docling image cells "
+            "instead of PDF-first fallback."
+        ),
     )
     p.add_argument(
         "--table-expand-from-structure",
@@ -527,7 +547,9 @@ def main() -> None:
         raise ValueError("--image-token-count must equal grid-size^2 for this script.")
 
     _, page_index = parse_page_id(args.page_id)
-    image_boxes = load_pdf_image_boxes(pdf_path=pdf_path, page_index=page_index)
+    image_boxes: List[List[float]] = []
+    if args.image_source in {"pdf", "hybrid"} or args.image_hybrid_union:
+        image_boxes = load_pdf_image_boxes(pdf_path=pdf_path, page_index=page_index)
     print(f"pdf image boxes: {len(image_boxes)} {image_boxes}")
 
     rows: List[Dict] = []
@@ -538,8 +560,9 @@ def main() -> None:
                 continue
             rows.append(json.loads(line))
 
-    # First pass: compute image patch set for the target page.
-    image_cells: Set[Tuple[int, int]] = set()
+    # First pass: compute per-source image patch sets for the target page.
+    image_cells_pdf: Set[Tuple[int, int]] = set()
+    image_cells_docling: Set[Tuple[int, int]] = set()
     page_structure_cells: Set[Tuple[int, int]] = set()
     page_table_text_cells: Set[Tuple[int, int]] = set()
     page_ocr_cells: Set[Tuple[int, int]] = set()
@@ -558,6 +581,7 @@ def main() -> None:
         struct_w = 0.0
         table_text_w = 0.0
         ocr_w = 0.0
+        visual_w = 0.0
         for item in row.get("top_concepts", []):
             c = str(item.get("concept", "")).strip().lower()
             w = float(item.get("weight", 0.0))
@@ -567,6 +591,8 @@ def main() -> None:
                 table_text_w = max(table_text_w, w)
             elif c == "ocr_text":
                 ocr_w = max(ocr_w, w)
+            elif c in {"visual_region", "image_region"}:
+                visual_w = max(visual_w, w)
 
         if struct_w > 0:
             page_structure_cells.add((rr, cc))
@@ -574,6 +600,8 @@ def main() -> None:
             page_table_text_cells.add((rr, cc))
         if ocr_w > 0:
             page_ocr_cells.add((rr, cc))
+        if visual_w > 0:
+            image_cells_docling.add((rr, cc))
 
         hit = False
         for b in image_boxes:
@@ -586,7 +614,28 @@ def main() -> None:
                     hit = True
                     break
         if hit:
-            image_cells.add((rr, cc))
+            image_cells_pdf.add((rr, cc))
+
+    image_cells: Set[Tuple[int, int]]
+    if args.image_source == "pdf":
+        image_cells = set(image_cells_pdf)
+    elif args.image_source == "docling":
+        image_cells = set(image_cells_docling)
+    else:
+        # hybrid
+        if args.image_hybrid_union:
+            image_cells = set(image_cells_pdf) | set(image_cells_docling)
+        else:
+            image_cells = set(image_cells_pdf) if image_cells_pdf else set(image_cells_docling)
+
+    print(
+        "image derivation -> "
+        f"source={args.image_source} "
+        f"pdf_cells={len(image_cells_pdf)} "
+        f"docling_cells={len(image_cells_docling)} "
+        f"final_image_cells={len(image_cells)} "
+        f"hybrid_union={bool(args.image_hybrid_union)}"
+    )
 
     # Derive table cells robustly: structure seeds + nearby table_text.
     table_cells: Set[Tuple[int, int]] = set(page_structure_cells)
@@ -737,6 +786,8 @@ def main() -> None:
         "image_token_count": args.image_token_count,
         "image_hit_mode": args.image_hit_mode,
         "image_overlap_threshold": args.image_overlap_threshold,
+        "image_source": args.image_source,
+        "image_hybrid_union": bool(args.image_hybrid_union),
         "table_expand_from_structure": int(args.table_expand_from_structure),
         "allow_table_text_only_fallback": bool(args.allow_table_text_only_fallback),
         "table_text_only_max_frac": float(args.table_text_only_max_frac),
@@ -750,6 +801,11 @@ def main() -> None:
         "table_component_rect_min_cells": int(args.table_component_rect_min_cells),
         "table_component_rect_max_area_frac": float(args.table_component_rect_max_area_frac),
         "pdf_image_boxes": image_boxes,
+        "image_derivation": {
+            "pdf_cells": len(image_cells_pdf),
+            "docling_cells": len(image_cells_docling),
+            "final_cells": len(image_cells),
+        },
         "table_derivation": {
             "structure_cells": len(page_structure_cells),
             "table_text_cells": len(page_table_text_cells),
