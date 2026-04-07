@@ -64,6 +64,42 @@ def parse_args() -> argparse.Namespace:
         help="Min patch overlap for visual zone hit.",
     )
     p.add_argument(
+        "--min-table-box-area-frac",
+        type=float,
+        default=0.0,
+        help="Drop Docling table zones with normalized area below this threshold.",
+    )
+    p.add_argument(
+        "--max-table-box-area-frac",
+        type=float,
+        default=1.0,
+        help="Drop Docling table zones with normalized area above this threshold.",
+    )
+    p.add_argument(
+        "--min-table-box-width-frac",
+        type=float,
+        default=0.0,
+        help="Drop Docling table zones narrower than this normalized width.",
+    )
+    p.add_argument(
+        "--max-table-box-width-frac",
+        type=float,
+        default=1.0,
+        help="Drop Docling table zones wider than this normalized width.",
+    )
+    p.add_argument(
+        "--min-table-box-height-frac",
+        type=float,
+        default=0.0,
+        help="Drop Docling table zones shorter than this normalized height.",
+    )
+    p.add_argument(
+        "--max-table-box-height-frac",
+        type=float,
+        default=1.0,
+        help="Drop Docling table zones taller than this normalized height.",
+    )
+    p.add_argument(
         "--include-visual-region",
         action="store_true",
         help="Emit visual_region from Docling figure/picture-like zones.",
@@ -474,11 +510,18 @@ def extract_docling_zone_boxes(
     page_sizes: Dict[int, Tuple[float, float]],
     valid_page_indices: Set[int],
     page_offset: int,
-) -> Tuple[Dict[int, List[List[float]]], Dict[int, List[List[float]]], Dict[int, List[List[float]]], List[Dict[str, Any]]]:
+    min_table_area: float,
+    max_table_area: float,
+    min_table_w: float,
+    max_table_w: float,
+    min_table_h: float,
+    max_table_h: float,
+) -> Tuple[Dict[int, List[List[float]]], Dict[int, List[List[float]]], Dict[int, List[List[float]]], List[Dict[str, Any]], Dict[str, int]]:
     page_text_boxes: Dict[int, List[List[float]]] = defaultdict(list)
     page_table_boxes: Dict[int, List[List[float]]] = defaultdict(list)
     page_visual_boxes: Dict[int, List[List[float]]] = defaultdict(list)
     debug_rows: List[Dict[str, Any]] = []
+    stats = defaultdict(int)
 
     for item in iter_docling_items(doc):
         raw_label = get_attr_or_key(item, "label", None)
@@ -517,13 +560,47 @@ def extract_docling_zone_boxes(
             )
             if bbox_norm is None:
                 continue
+            stats["zones_after_norm"] += 1
+
+            bw = float(bbox_norm[2] - bbox_norm[0])
+            bh = float(bbox_norm[3] - bbox_norm[1])
+            ba = bw * bh
+
+            if zone_type == "table":
+                if (
+                    ba < min_table_area
+                    or ba > max_table_area
+                    or bw < min_table_w
+                    or bw > max_table_w
+                    or bh < min_table_h
+                    or bh > max_table_h
+                ):
+                    stats["table_boxes_filtered"] += 1
+                    debug_rows.append(
+                        {
+                            "page_index": page_index,
+                            "zone_type": zone_type,
+                            "label": label,
+                            "bbox_norm_xyxy": [round(float(v), 6) for v in bbox_norm],
+                            "bbox_raw_xyxy": [float(v) for v in bbox_raw],
+                            "origin_hint": origin,
+                            "filtered_reason": "table_box_geometry",
+                            "bbox_w": round(bw, 6),
+                            "bbox_h": round(bh, 6),
+                            "bbox_area": round(ba, 6),
+                        }
+                    )
+                    continue
 
             if zone_type == "table":
                 page_table_boxes[page_index].append(bbox_norm)
+                stats["table_boxes_kept"] += 1
             elif zone_type == "text":
                 page_text_boxes[page_index].append(bbox_norm)
+                stats["text_boxes_kept"] += 1
             elif zone_type == "visual":
                 page_visual_boxes[page_index].append(bbox_norm)
+                stats["visual_boxes_kept"] += 1
 
             debug_rows.append(
                 {
@@ -535,8 +612,9 @@ def extract_docling_zone_boxes(
                     "origin_hint": origin,
                 }
             )
+            stats["zones_kept"] += 1
 
-    return page_text_boxes, page_table_boxes, page_visual_boxes, debug_rows
+    return page_text_boxes, page_table_boxes, page_visual_boxes, debug_rows, dict(stats)
 
 
 def main() -> None:
@@ -597,11 +675,17 @@ def main() -> None:
         valid_page_indices=valid_page_indices,
         mode=args.docling_page_number_base,
     )
-    page_text_boxes, page_table_boxes, page_visual_boxes, debug_rows = extract_docling_zone_boxes(
+    page_text_boxes, page_table_boxes, page_visual_boxes, debug_rows, zone_stats = extract_docling_zone_boxes(
         doc=doc,
         page_sizes=page_sizes,
         valid_page_indices=valid_page_indices,
         page_offset=page_offset,
+        min_table_area=float(args.min_table_box_area_frac),
+        max_table_area=float(args.max_table_box_area_frac),
+        min_table_w=float(args.min_table_box_width_frac),
+        max_table_w=float(args.max_table_box_width_frac),
+        min_table_h=float(args.min_table_box_height_frac),
+        max_table_h=float(args.max_table_box_height_frac),
     )
 
     page_text_hits: Dict[str, Set[int]] = {}
@@ -703,6 +787,14 @@ def main() -> None:
         "min_overlap_text": args.min_overlap_text,
         "min_overlap_table": args.min_overlap_table,
         "min_overlap_visual": args.min_overlap_visual,
+        "table_box_filters": {
+            "min_area_frac": float(args.min_table_box_area_frac),
+            "max_area_frac": float(args.max_table_box_area_frac),
+            "min_width_frac": float(args.min_table_box_width_frac),
+            "max_width_frac": float(args.max_table_box_width_frac),
+            "min_height_frac": float(args.min_table_box_height_frac),
+            "max_height_frac": float(args.max_table_box_height_frac),
+        },
         "include_visual_region": bool(args.include_visual_region),
         "docling_device_requested": args.docling_device,
         "docling_device_used": docling_device_used,
@@ -722,6 +814,7 @@ def main() -> None:
             "table_boxes_total": int(sum(len(v) for v in page_table_boxes.values())),
             "visual_boxes_total": int(sum(len(v) for v in page_visual_boxes.values())),
         },
+        "docling_zone_stats": zone_stats,
         "counts": dict(counts),
     }
 
