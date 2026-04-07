@@ -39,6 +39,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--max-length", type=int, default=192)
+    parser.add_argument(
+        "--negative-qtypes",
+        type=str,
+        default="TextQ",
+        help=(
+            "Comma-separated MMQA question types to treat as negative class. "
+            "Examples: 'TextQ' or 'TextQ,TableQ'."
+        ),
+    )
     parser.add_argument("--train-per-class", type=int, default=2000)
     parser.add_argument("--dev-per-class", type=int, default=230)
     parser.add_argument("--epochs", type=int, default=2)
@@ -106,9 +115,25 @@ def get_question_type(record: Dict[str, Any]) -> str:
     return ""
 
 
-def read_mmqa_binary_rows(path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+def parse_negative_qtypes(csv_value: str) -> List[str]:
+    out: List[str] = []
+    for x in str(csv_value).split(","):
+        v = x.strip()
+        if not v:
+            continue
+        out.append(v.lower())
+    if not out:
+        raise ValueError("negative-qtypes cannot be empty")
+    return sorted(set(out))
+
+
+def read_mmqa_binary_rows(
+    path: str,
+    negative_qtypes: List[str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, Dict[str, int]]:
     imageq: List[Dict[str, Any]] = []
-    textq: List[Dict[str, Any]] = []
+    negative: List[Dict[str, Any]] = []
+    counts_by_type: Dict[str, int] = {}
     total = 0
     with open(path, "r") as handle:
         for line_idx, line in enumerate(handle):
@@ -118,6 +143,7 @@ def read_mmqa_binary_rows(path: str) -> Tuple[List[Dict[str, Any]], List[Dict[st
             total += 1
             record = json.loads(line)
             qtype = get_question_type(record).lower()
+            counts_by_type[qtype] = counts_by_type.get(qtype, 0) + 1
             qtext = get_query_text(record)
             if not qtext:
                 continue
@@ -128,23 +154,23 @@ def read_mmqa_binary_rows(path: str) -> Tuple[List[Dict[str, Any]], List[Dict[st
             if qtype == "imageq":
                 row["label"] = POS_LABEL
                 imageq.append(row)
-            elif qtype == "textq":
+            elif qtype in negative_qtypes:
                 row["label"] = NEG_LABEL
-                textq.append(row)
-    return imageq, textq, total
+                negative.append(row)
+    return imageq, negative, total, counts_by_type
 
 
 def build_balanced(
     imageq: List[Dict[str, Any]],
-    textq: List[Dict[str, Any]],
+    negative: List[Dict[str, Any]],
     per_class: int,
     seed: int,
 ) -> List[Dict[str, Any]]:
-    n = min(len(imageq), len(textq))
+    n = min(len(imageq), len(negative))
     if per_class > 0:
         n = min(n, per_class)
     rng = random.Random(seed)
-    selected = rng.sample(imageq, n) + rng.sample(textq, n)
+    selected = rng.sample(imageq, n) + rng.sample(negative, n)
     rng.shuffle(selected)
     return selected
 
@@ -334,22 +360,32 @@ def train_one_epoch(
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+    negative_qtypes = parse_negative_qtypes(args.negative_qtypes)
+    if "imageq" in negative_qtypes:
+        raise ValueError("negative-qtypes must not include ImageQ")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_img, train_txt, train_total = read_mmqa_binary_rows(args.train_jsonl)
-    dev_img, dev_txt, dev_total = read_mmqa_binary_rows(args.dev_jsonl)
-    train_rows = build_balanced(train_img, train_txt, args.train_per_class, args.seed)
-    dev_rows = build_balanced(dev_img, dev_txt, args.dev_per_class, args.seed + 7)
+    train_img, train_neg, train_total, train_type_counts = read_mmqa_binary_rows(
+        args.train_jsonl, negative_qtypes
+    )
+    dev_img, dev_neg, dev_total, dev_type_counts = read_mmqa_binary_rows(
+        args.dev_jsonl, negative_qtypes
+    )
+    train_rows = build_balanced(train_img, train_neg, args.train_per_class, args.seed)
+    dev_rows = build_balanced(dev_img, dev_neg, args.dev_per_class, args.seed + 7)
 
     print("=== Data Summary ===")
+    print(f"negative_qtypes:         {','.join(negative_qtypes)}")
     print(f"train_jsonl_total_rows: {train_total}")
     print(f"dev_jsonl_total_rows:   {dev_total}")
     print(f"train_imageq_available: {len(train_img)}")
-    print(f"train_textq_available:  {len(train_txt)}")
+    print(f"train_negative_available:{len(train_neg)}")
     print(f"dev_imageq_available:   {len(dev_img)}")
-    print(f"dev_textq_available:    {len(dev_txt)}")
+    print(f"dev_negative_available: {len(dev_neg)}")
+    print(f"train_type_counts:      {train_type_counts}")
+    print(f"dev_type_counts:        {dev_type_counts}")
     print(f"train_balanced_rows:    {len(train_rows)}")
     print(f"dev_balanced_rows:      {len(dev_rows)}")
 
