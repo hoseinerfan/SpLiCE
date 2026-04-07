@@ -180,8 +180,11 @@ def extract_bbox_xyxy_raw(bbox_obj: Any) -> Optional[Tuple[float, float, float, 
             vals = [safe_float(bbox_obj.get(k)) for k in keys]
             if all(v is not None for v in vals):
                 x0, y0, x1, y1 = vals  # type: ignore[misc]
+                # Docling-style top/bottom coordinates may come in either order.
+                x0, x1 = min(float(x0), float(x1)), max(float(x0), float(x1))
+                y0, y1 = min(float(y0), float(y1)), max(float(y0), float(y1))
                 if x1 > x0 and y1 > y0:
-                    return float(x0), float(y0), float(x1), float(y1)
+                    return x0, y0, x1, y1
         return None
 
     # Object attrs
@@ -193,8 +196,10 @@ def extract_bbox_xyxy_raw(bbox_obj: Any) -> Optional[Tuple[float, float, float, 
         vals = [safe_float(getattr(bbox_obj, k, None)) for k in keys]
         if all(v is not None for v in vals):
             x0, y0, x1, y1 = vals  # type: ignore[misc]
+            x0, x1 = min(float(x0), float(x1)), max(float(x0), float(x1))
+            y0, y1 = min(float(y0), float(y1)), max(float(y0), float(y1))
             if x1 > x0 and y1 > y0:
-                return float(x0), float(y0), float(x1), float(y1)
+                return x0, y0, x1, y1
     return None
 
 
