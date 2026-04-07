@@ -86,6 +86,34 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional extracted Docling zones dump (debug).",
     )
+    p.add_argument(
+        "--docling-device",
+        type=str,
+        default="cpu",
+        choices=["auto", "cpu", "cuda", "mps", "xpu"],
+        help="Docling accelerator device.",
+    )
+    p.add_argument(
+        "--docling-num-threads",
+        type=int,
+        default=8,
+        help="Thread count passed to Docling accelerator options.",
+    )
+    p.add_argument(
+        "--docling-do-ocr",
+        action="store_true",
+        help="Enable OCR stage in Docling conversion.",
+    )
+    p.add_argument(
+        "--docling-do-table-structure",
+        action="store_true",
+        help="Enable table-structure stage in Docling conversion.",
+    )
+    p.add_argument(
+        "--docling-fallback-to-cpu",
+        action="store_true",
+        help="On accelerator failure, retry conversion on CPU.",
+    )
     return p.parse_args()
 
 
@@ -308,21 +336,90 @@ def iter_docling_items(doc: Any) -> Iterable[Any]:
                 yield x
 
 
-def run_docling_convert(pdf_path: Path) -> Any:
+def build_docling_converter(
+    device: str,
+    num_threads: int,
+    do_ocr: bool,
+    do_table_structure: bool,
+) -> Any:
     try:
+        from docling.datamodel.base_models import InputFormat
+        try:
+            from docling.datamodel.accelerator_options import AcceleratorOptions
+        except Exception:
+            from docling.datamodel.pipeline_options import AcceleratorOptions  # type: ignore[attr-defined]
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
         from docling.document_converter import DocumentConverter
+        from docling.document_converter import PdfFormatOption
     except Exception as exc:
         raise RuntimeError(
             "Docling is not installed in this environment. "
             "Install in your target env with: pip install docling"
         ) from exc
 
-    converter = DocumentConverter()
-    result = converter.convert(str(pdf_path))
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.accelerator_options = AcceleratorOptions(
+        num_threads=int(num_threads),
+        device=str(device),
+    )
+    pipeline_options.do_ocr = bool(do_ocr)
+    pipeline_options.do_table_structure = bool(do_table_structure)
+
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_options=pipeline_options,
+            )
+        }
+    )
+    return converter
+
+
+def run_docling_convert(
+    pdf_path: Path,
+    device: str,
+    num_threads: int,
+    do_ocr: bool,
+    do_table_structure: bool,
+    fallback_to_cpu: bool,
+) -> Tuple[Any, str]:
+    converter = build_docling_converter(
+        device=device,
+        num_threads=num_threads,
+        do_ocr=do_ocr,
+        do_table_structure=do_table_structure,
+    )
+    try:
+        result = converter.convert(str(pdf_path))
+        used_device = str(device).lower()
+    except Exception as exc:
+        emsg = str(exc).lower()
+        accel_error = (
+            "cuda" in emsg
+            or "xpu" in emsg
+            or "mps" in emsg
+            or "driver error" in emsg
+            or "conversionstatus.failure" in emsg
+        )
+        if not fallback_to_cpu or str(device).lower() == "cpu" or not accel_error:
+            raise
+        print(
+            "Docling conversion failed on accelerator "
+            f"'{device}' ({exc}). Retrying on CPU..."
+        )
+        converter = build_docling_converter(
+            device="cpu",
+            num_threads=num_threads,
+            do_ocr=do_ocr,
+            do_table_structure=do_table_structure,
+        )
+        result = converter.convert(str(pdf_path))
+        used_device = "cpu"
+
     doc = get_attr_or_key(result, "document", None)
     if doc is None:
         raise RuntimeError("Docling conversion returned no document object.")
-    return doc
+    return doc, used_device
 
 
 def extract_docling_zone_boxes(
@@ -439,7 +536,14 @@ def main() -> None:
     if missing:
         raise ValueError(f"Page indices in labels not present in PDF: {missing}")
 
-    doc = run_docling_convert(pdf_path=pdf_path)
+    doc, docling_device_used = run_docling_convert(
+        pdf_path=pdf_path,
+        device=args.docling_device,
+        num_threads=args.docling_num_threads,
+        do_ocr=args.docling_do_ocr,
+        do_table_structure=args.docling_do_table_structure,
+        fallback_to_cpu=args.docling_fallback_to_cpu,
+    )
     page_text_boxes, page_table_boxes, page_visual_boxes, debug_rows = extract_docling_zone_boxes(
         doc=doc,
         page_sizes=page_sizes,
@@ -546,6 +650,12 @@ def main() -> None:
         "min_overlap_table": args.min_overlap_table,
         "min_overlap_visual": args.min_overlap_visual,
         "include_visual_region": bool(args.include_visual_region),
+        "docling_device_requested": args.docling_device,
+        "docling_device_used": docling_device_used,
+        "docling_num_threads": int(args.docling_num_threads),
+        "docling_do_ocr": bool(args.docling_do_ocr),
+        "docling_do_table_structure": bool(args.docling_do_table_structure),
+        "docling_fallback_to_cpu": bool(args.docling_fallback_to_cpu),
         "docling_zone_counts": {
             "text_boxes_total": int(sum(len(v) for v in page_text_boxes.values())),
             "table_boxes_total": int(sum(len(v) for v in page_table_boxes.values())),
