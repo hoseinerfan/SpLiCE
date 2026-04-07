@@ -151,6 +151,14 @@ def parse_args() -> argparse.Namespace:
         help="Maximum bbox area fraction allowed for component rectangle fill.",
     )
     p.add_argument(
+        "--backfill-ocr-from-table-text",
+        action="store_true",
+        help=(
+            "If a patch had table_text in input but is not kept in final table_all, "
+            "relabel it as ocr_text (unless image patch)."
+        ),
+    )
+    p.add_argument(
         "--summary-json",
         type=str,
         default="",
@@ -701,6 +709,7 @@ def main() -> None:
     # Second pass: rewrite concepts for target page.
     out_path.parent.mkdir(parents=True, exist_ok=True)
     counts = defaultdict(int)
+    counts["ocr_backfilled_from_table_text"] = 0
     concept_cells: Dict[str, Set[Tuple[int, int]]] = {
         "table_all": set(),
         "ocr_text": set(),
@@ -747,6 +756,15 @@ def main() -> None:
                 table_w = 0.0
                 if in_table:
                     table_w = max(struct_w, table_text_w)
+                elif (
+                    args.backfill_ocr_from_table_text
+                    and (not in_image)
+                    and table_text_w > 0
+                    and ocr_w <= 0
+                ):
+                    # Recover dropped table_text cells as OCR text when table mask is narrowed.
+                    ocr_w = table_text_w
+                    counts["ocr_backfilled_from_table_text"] += 1
 
                 new_tc: List[Dict] = []
                 if table_w > 0:
@@ -800,6 +818,7 @@ def main() -> None:
         "table_component_rect_fill": bool(args.table_component_rect_fill),
         "table_component_rect_min_cells": int(args.table_component_rect_min_cells),
         "table_component_rect_max_area_frac": float(args.table_component_rect_max_area_frac),
+        "backfill_ocr_from_table_text": bool(args.backfill_ocr_from_table_text),
         "pdf_image_boxes": image_boxes,
         "image_derivation": {
             "pdf_cells": len(image_cells_pdf),
@@ -815,6 +834,7 @@ def main() -> None:
             "image_region": int(counts["image_region"]),
             "ocr_text": int(counts["ocr_text"]),
             "table_all": int(counts["table_all"]),
+            "ocr_backfilled_from_table_text": int(counts["ocr_backfilled_from_table_text"]),
         },
     }
 
