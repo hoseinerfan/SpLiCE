@@ -6,6 +6,7 @@ import random
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -19,11 +20,48 @@ from transformers import (
 )
 
 
+COARSE_KEY_ORDER = [
+    "textq",
+    "tableq",
+    "visualsingle",
+    "multihoptexttable",
+    "multihopwithvisual",
+]
+
+COARSE_KEY_TO_DISPLAY = {
+    "textq": "TextQ",
+    "tableq": "TableQ",
+    "visualsingle": "VisualSingle",
+    "multihoptexttable": "MultihopTextTable",
+    "multihopwithvisual": "MultihopWithVisual",
+}
+
+# Keys are normalized qtype names from normalize_qtype_name().
+EXACT_TO_COARSE_KEY = {
+    "textq": "textq",
+    "tableq": "tableq",
+    "imageq": "visualsingle",
+    "imagelistq": "visualsingle",
+    "compose(textq,tableq)": "multihoptexttable",
+    "compose(tableq,textq)": "multihoptexttable",
+    "intersect(tableq,textq)": "multihoptexttable",
+    "compare(tableq,compose(tableq,textq))": "multihoptexttable",
+    "compose(tableq,imagelistq)": "multihopwithvisual",
+    "compose(textq,imagelistq)": "multihopwithvisual",
+    "compose(imageq,tableq)": "multihopwithvisual",
+    "compose(imageq,textq)": "multihopwithvisual",
+    "intersect(imagelistq,tableq)": "multihopwithvisual",
+    "intersect(imagelistq,textq)": "multihopwithvisual",
+    "compare(compose(tableq,imageq),tableq)": "multihopwithvisual",
+    "compare(compose(tableq,imageq),compose(tableq,textq))": "multihopwithvisual",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Train a question-type classifier on MMQA question text with configurable "
-            "label space (including exact 16-class qtype)."
+            "label space (exact qtypes or coarse routing labels)."
         )
     )
     parser.add_argument("--train-jsonl", type=str, required=True)
@@ -38,12 +76,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--max-length", type=int, default=192)
     parser.add_argument(
+        "--label-space",
+        type=str,
+        default="exact16",
+        choices=["exact16", "coarse5"],
+        help="Training label space.",
+    )
+    parser.add_argument(
         "--qtypes",
         type=str,
         default="all",
         help=(
-            "Comma-separated qtypes to include, or 'all' for every type observed in train/dev. "
-            "Matching is case-insensitive."
+            "Comma-separated exact qtypes to include, or 'all'. "
+            "Matching is case-insensitive and whitespace-insensitive."
         ),
     )
     parser.add_argument(
@@ -90,10 +135,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument(
+        "--loss-type",
+        type=str,
+        default="ce",
+        choices=["ce", "focal"],
+        help="Training/eval loss.",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=2.0,
+        help="Gamma used when --loss-type focal.",
+    )
+    parser.add_argument(
         "--use-class-weights",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use inverse-frequency class weights in cross entropy.",
+        help="Use inverse-frequency class weights.",
     )
     parser.add_argument(
         "--reinit-classifier",
@@ -114,6 +172,11 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def normalize_qtype_name(name: str) -> str:
+    # Remove all whitespace so variants like "Compose(A, B)" are treated identically.
+    return "".join(str(name).lower().split())
 
 
 def get_by_path(record: Dict[str, Any], dot_path: str) -> Any:
@@ -168,7 +231,7 @@ def read_mmqa_rows(path: str) -> Tuple[List[Dict[str, Any]], Dict[str, str], int
             qtype_raw = get_question_type(record)
             if not qtype_raw:
                 continue
-            qtype_norm = qtype_raw.lower()
+            qtype_norm = normalize_qtype_name(qtype_raw)
             qtext = get_query_text(record)
             if not qtext:
                 continue
@@ -191,7 +254,7 @@ def parse_qtypes_arg(qtypes_arg: str) -> Optional[List[str]]:
     for item in str(qtypes_arg).split(","):
         item = item.strip()
         if item:
-            out.append(item.lower())
+            out.append(normalize_qtype_name(item))
     if not out:
         raise ValueError("--qtypes cannot be empty")
     return out
@@ -203,64 +266,127 @@ def build_label_maps(
     train_display: Dict[str, str],
     dev_display: Dict[str, str],
     qtypes_arg: str,
-) -> Tuple[Dict[str, int], Dict[int, str], List[str]]:
-    selected_norms = parse_qtypes_arg(qtypes_arg)
-    all_norms = sorted(
+    label_space: str,
+) -> Tuple[
+    List[str],  # selected_exact_norms
+    Dict[str, int],  # label_key_to_idx
+    Dict[int, str],  # label_to_name
+    Dict[str, int],  # exact_norm_to_label_idx
+    Dict[str, str],  # exact_norm_to_label_name
+]:
+    selected_exact_norms = parse_qtypes_arg(qtypes_arg)
+    all_exact_norms = sorted(
         set([r["qtype_norm"] for r in train_rows] + [r["qtype_norm"] for r in dev_rows])
     )
-    if selected_norms is None:
-        selected_norms = all_norms
+    if selected_exact_norms is None:
+        selected_exact_norms = all_exact_norms
 
-    missing = [t for t in selected_norms if t not in all_norms]
+    missing = [t for t in selected_exact_norms if t not in all_exact_norms]
     if missing:
         raise ValueError(f"Requested qtypes not found in train/dev: {missing}")
 
-    type_to_label = {t: i for i, t in enumerate(selected_norms)}
-    label_to_name: Dict[int, str] = {}
-    for t, idx in type_to_label.items():
-        display = train_display.get(t) or dev_display.get(t) or t
-        label_to_name[idx] = display
+    if label_space == "exact16":
+        label_keys = list(selected_exact_norms)
+        label_key_to_idx = {k: i for i, k in enumerate(label_keys)}
+        label_to_name = {
+            i: (train_display.get(k) or dev_display.get(k) or k) for k, i in label_key_to_idx.items()
+        }
+        exact_norm_to_label_idx = {k: label_key_to_idx[k] for k in selected_exact_norms}
+        exact_norm_to_label_name = {
+            k: label_to_name[exact_norm_to_label_idx[k]] for k in selected_exact_norms
+        }
+        return (
+            selected_exact_norms,
+            label_key_to_idx,
+            label_to_name,
+            exact_norm_to_label_idx,
+            exact_norm_to_label_name,
+        )
 
-    return type_to_label, label_to_name, selected_norms
+    # coarse5 mapping path
+    unmapped = [k for k in selected_exact_norms if k not in EXACT_TO_COARSE_KEY]
+    if unmapped:
+        raise ValueError(
+            f"Exact qtypes missing in coarse mapping. Add these keys to EXACT_TO_COARSE_KEY: {unmapped}"
+        )
+
+    mapped_coarse_keys = {EXACT_TO_COARSE_KEY[k] for k in selected_exact_norms}
+    unknown_coarse = [k for k in mapped_coarse_keys if k not in COARSE_KEY_TO_DISPLAY]
+    if unknown_coarse:
+        raise ValueError(f"Unknown coarse labels in mapping: {unknown_coarse}")
+
+    label_keys = [k for k in COARSE_KEY_ORDER if k in mapped_coarse_keys]
+    label_key_to_idx = {k: i for i, k in enumerate(label_keys)}
+    label_to_name = {label_key_to_idx[k]: COARSE_KEY_TO_DISPLAY[k] for k in label_keys}
+
+    exact_norm_to_label_idx = {
+        ex: label_key_to_idx[EXACT_TO_COARSE_KEY[ex]] for ex in selected_exact_norms
+    }
+    exact_norm_to_label_name = {
+        ex: label_to_name[exact_norm_to_label_idx[ex]] for ex in selected_exact_norms
+    }
+
+    # Assertion: every selected exact type maps to exactly one coarse class.
+    assert len(exact_norm_to_label_idx) == len(selected_exact_norms)
+    # Assertion: every coarse class in this run has at least one exact source.
+    for coarse_key in label_keys:
+        assert any(EXACT_TO_COARSE_KEY[ex] == coarse_key for ex in selected_exact_norms)
+
+    return (
+        selected_exact_norms,
+        label_key_to_idx,
+        label_to_name,
+        exact_norm_to_label_idx,
+        exact_norm_to_label_name,
+    )
 
 
 def build_rows(
     rows: List[Dict[str, Any]],
-    selected_norms: List[str],
-    type_to_label: Dict[str, int],
+    selected_exact_norms: List[str],
+    exact_norm_to_label_idx: Dict[str, int],
+    exact_norm_to_label_name: Dict[str, str],
     sampling: str,
     per_class_cap: int,
     seed: int,
 ) -> List[Dict[str, Any]]:
-    by_type: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    selected_set = set(selected_exact_norms)
+    filtered_rows: List[Dict[str, Any]] = []
     for row in rows:
-        t = row["qtype_norm"]
-        if t in type_to_label:
-            by_type[t].append(
-                {
-                    "query_id": row["query_id"],
-                    "query_text": row["query_text"],
-                    "label": int(type_to_label[t]),
-                    "qtype_norm": t,
-                    "qtype_raw": row["qtype_raw"],
-                }
-            )
+        ex = row["qtype_norm"]
+        if ex not in selected_set:
+            continue
+        filtered_rows.append(
+            {
+                "query_id": row["query_id"],
+                "query_text": row["query_text"],
+                "label": int(exact_norm_to_label_idx[ex]),
+                "label_name": exact_norm_to_label_name[ex],
+                "qtype_norm": ex,
+                "qtype_raw": row["qtype_raw"],
+            }
+        )
 
-    for t in selected_norms:
-        if len(by_type[t]) == 0:
-            raise ValueError(f"No rows found for selected qtype: {t}")
+    grouped: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for row in filtered_rows:
+        grouped[int(row["label"])].append(row)
+
+    label_ids = sorted(set(exact_norm_to_label_idx.values()))
+    for label_id in label_ids:
+        if len(grouped[label_id]) == 0:
+            raise ValueError(f"No rows found for label_id={label_id}")
 
     rng = random.Random(seed)
     out: List[Dict[str, Any]] = []
     if sampling == "balanced":
-        n = min(len(by_type[t]) for t in selected_norms)
+        n = min(len(grouped[label_id]) for label_id in label_ids)
         if per_class_cap > 0:
             n = min(n, per_class_cap)
-        for t in selected_norms:
-            out.extend(rng.sample(by_type[t], n))
+        for label_id in label_ids:
+            out.extend(rng.sample(grouped[label_id], n))
     else:
-        for t in selected_norms:
-            items = by_type[t]
+        for label_id in label_ids:
+            items = grouped[label_id]
             if per_class_cap > 0 and len(items) > per_class_cap:
                 items = rng.sample(items, per_class_cap)
             out.extend(items)
@@ -290,6 +416,7 @@ class TextClsDataset(Dataset):
             "query_text": row["query_text"],
             "labels": int(row["label"]),
             "gold_qtype": row["qtype_raw"],
+            "gold_label_name": row["label_name"],
             **enc,
         }
 
@@ -302,6 +429,7 @@ class Collator:
         qids = [f["query_id"] for f in features]
         qtexts = [f["query_text"] for f in features]
         gtypes = [f["gold_qtype"] for f in features]
+        glabel_names = [f["gold_label_name"] for f in features]
         labels = [int(f["labels"]) for f in features]
 
         model_feats = []
@@ -310,7 +438,8 @@ class Collator:
                 {
                     k: v
                     for k, v in f.items()
-                    if k not in {"query_id", "query_text", "labels", "gold_qtype"}
+                    if k
+                    not in {"query_id", "query_text", "labels", "gold_qtype", "gold_label_name"}
                 }
             )
 
@@ -319,6 +448,7 @@ class Collator:
         batch["query_id"] = qids
         batch["query_text"] = qtexts
         batch["gold_qtype"] = gtypes
+        batch["gold_label_name"] = glabel_names
         return batch
 
 
@@ -371,6 +501,30 @@ def metrics_from_confusion(conf: List[List[int]], label_to_name: Dict[int, str])
     }
 
 
+def compute_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    loss_type: str,
+    focal_gamma: float,
+    class_weights: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if loss_type == "ce":
+        return F.cross_entropy(logits, labels, weight=class_weights)
+
+    if loss_type != "focal":
+        raise ValueError(f"Unsupported loss_type: {loss_type}")
+
+    # Focal loss over per-example CE, optionally class-weighted.
+    log_probs = F.log_softmax(logits, dim=-1)
+    log_pt = log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)
+    pt = log_pt.exp()
+    ce = -log_pt
+    if class_weights is not None:
+        ce = ce * class_weights[labels]
+    focal_factor = (1.0 - pt).clamp(min=0.0) ** focal_gamma
+    return (focal_factor * ce).mean()
+
+
 @torch.no_grad()
 def evaluate(
     model: Any,
@@ -379,6 +533,8 @@ def evaluate(
     use_bf16: bool,
     label_to_name: Dict[int, str],
     class_weights: Optional[torch.Tensor],
+    loss_type: str,
+    focal_gamma: float,
 ) -> Dict[str, Any]:
     model.eval()
     all_labels: List[int] = []
@@ -394,12 +550,19 @@ def evaluate(
         qids = batch.pop("query_id")
         qtexts = batch.pop("query_text")
         gtypes = batch.pop("gold_qtype")
+        glabel_names = batch.pop("gold_label_name")
         batch.pop("labels")
         batch = {k: v.to(device) for k, v in batch.items()}
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16):
             logits = model(**batch).logits
-            loss = F.cross_entropy(logits, labels, weight=class_weights)
+            loss = compute_loss(
+                logits=logits,
+                labels=labels,
+                loss_type=loss_type,
+                focal_gamma=focal_gamma,
+                class_weights=class_weights,
+            )
         probs = torch.softmax(logits, dim=-1)
         preds = torch.argmax(probs, dim=-1)
 
@@ -413,11 +576,14 @@ def evaluate(
         all_labels.extend(labels_cpu)
         all_preds.extend(preds_cpu)
 
-        for qid, qtext, gt, y, p, pr in zip(qids, qtexts, gtypes, labels_cpu, preds_cpu, probs_cpu):
+        for qid, qtext, gt, gyname, y, p, pr in zip(
+            qids, qtexts, gtypes, glabel_names, labels_cpu, preds_cpu, probs_cpu
+        ):
             out_row = {
                 "query_id": qid,
                 "query_text": qtext,
                 "gold_qtype": gt,
+                "gold_label_name": gyname,
                 "gold_label": int(y),
                 "pred_label": int(p),
                 "pred_qtype": label_to_name[int(p)],
@@ -442,6 +608,8 @@ def train_one_epoch(
     max_grad_norm: float,
     use_bf16: bool,
     class_weights: Optional[torch.Tensor],
+    loss_type: str,
+    focal_gamma: float,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -453,12 +621,19 @@ def train_one_epoch(
         batch.pop("query_id")
         batch.pop("query_text")
         batch.pop("gold_qtype")
+        batch.pop("gold_label_name")
         batch.pop("labels")
         batch = {k: v.to(device) for k, v in batch.items()}
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16):
             logits = model(**batch).logits
-            loss = F.cross_entropy(logits, labels, weight=class_weights)
+            loss = compute_loss(
+                logits=logits,
+                labels=labels,
+                loss_type=loss_type,
+                focal_gamma=focal_gamma,
+                class_weights=class_weights,
+            )
             loss = loss / grad_accum_steps
         loss.backward()
         total_loss += float(loss.item()) * grad_accum_steps
@@ -498,6 +673,13 @@ def count_by_qtype(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
+def count_by_label(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    out: Dict[str, int] = defaultdict(int)
+    for row in rows:
+        out[row["label_name"]] += 1
+    return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -508,42 +690,63 @@ def main() -> None:
     train_rows_all, train_display, train_total = read_mmqa_rows(args.train_jsonl)
     dev_rows_all, dev_display, dev_total = read_mmqa_rows(args.dev_jsonl)
 
-    type_to_label, label_to_name, selected_norms = build_label_maps(
+    (
+        selected_exact_norms,
+        label_key_to_idx,
+        label_to_name,
+        exact_norm_to_label_idx,
+        exact_norm_to_label_name,
+    ) = build_label_maps(
         train_rows=train_rows_all,
         dev_rows=dev_rows_all,
         train_display=train_display,
         dev_display=dev_display,
         qtypes_arg=args.qtypes,
+        label_space=args.label_space,
     )
 
     train_rows = build_rows(
         rows=train_rows_all,
-        selected_norms=selected_norms,
-        type_to_label=type_to_label,
+        selected_exact_norms=selected_exact_norms,
+        exact_norm_to_label_idx=exact_norm_to_label_idx,
+        exact_norm_to_label_name=exact_norm_to_label_name,
         sampling=args.train_sampling,
         per_class_cap=args.train_per_class,
         seed=args.seed,
     )
     dev_rows = build_rows(
         rows=dev_rows_all,
-        selected_norms=selected_norms,
-        type_to_label=type_to_label,
+        selected_exact_norms=selected_exact_norms,
+        exact_norm_to_label_idx=exact_norm_to_label_idx,
+        exact_norm_to_label_name=exact_norm_to_label_name,
         sampling=args.dev_sampling,
         per_class_cap=args.dev_per_class,
         seed=args.seed + 7,
     )
 
+    selected_exact_display = [
+        train_display.get(t) or dev_display.get(t) or t for t in selected_exact_norms
+    ]
+    selected_labels_display = [label_to_name[i] for i in sorted(label_to_name)]
+
     print("=== Data Summary ===")
     print(f"train_jsonl_total_rows: {train_total}")
     print(f"dev_jsonl_total_rows:   {dev_total}")
-    print(f"selected_qtypes:        {[label_to_name[type_to_label[t]] for t in selected_norms]}")
-    print(f"num_classes:            {len(type_to_label)}")
+    print(f"label_space:            {args.label_space}")
+    print(f"selected_exact_qtypes:  {selected_exact_display}")
+    print(f"selected_labels:        {selected_labels_display}")
+    print(f"num_classes:            {len(label_key_to_idx)}")
     print(f"train_sampling:         {args.train_sampling}")
     print(f"dev_sampling:           {args.dev_sampling}")
+    print(f"loss_type:              {args.loss_type}")
+    if args.loss_type == "focal":
+        print(f"focal_gamma:            {args.focal_gamma}")
     print(f"train_rows_used:        {len(train_rows)}")
     print(f"dev_rows_used:          {len(dev_rows)}")
     print(f"train_counts_by_qtype:  {count_by_qtype(train_rows)}")
     print(f"dev_counts_by_qtype:    {count_by_qtype(dev_rows)}")
+    print(f"train_counts_by_label:  {count_by_label(train_rows)}")
+    print(f"dev_counts_by_label:    {count_by_label(dev_rows)}")
 
     device = torch.device(args.device)
     use_bf16 = bool(args.bf16 and device.type == "cuda")
@@ -551,9 +754,9 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name,
-        num_labels=len(type_to_label),
-        id2label={i: label_to_name[i] for i in range(len(type_to_label))},
-        label2id={label_to_name[i]: i for i in range(len(type_to_label))},
+        num_labels=len(label_key_to_idx),
+        id2label={i: label_to_name[i] for i in range(len(label_key_to_idx))},
+        label2id={label_to_name[i]: i for i in range(len(label_key_to_idx))},
         ignore_mismatched_sizes=True,
     ).to(device)
     if args.reinit_classifier and hasattr(model, "classifier"):
@@ -580,7 +783,7 @@ def main() -> None:
 
     class_weights = None
     if args.use_class_weights:
-        class_weights = compute_class_weights(train_rows, len(type_to_label), device=device)
+        class_weights = compute_class_weights(train_rows, len(label_key_to_idx), device=device)
         print(f"class_weights: {[round(float(w), 6) for w in class_weights.detach().cpu().tolist()]}")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -610,6 +813,8 @@ def main() -> None:
             max_grad_norm=args.max_grad_norm,
             use_bf16=use_bf16,
             class_weights=class_weights,
+            loss_type=args.loss_type,
+            focal_gamma=args.focal_gamma,
         )
         ev = evaluate(
             model=model,
@@ -618,6 +823,8 @@ def main() -> None:
             use_bf16=use_bf16,
             label_to_name=label_to_name,
             class_weights=class_weights,
+            loss_type=args.loss_type,
+            focal_gamma=args.focal_gamma,
         )
         dev_metrics = ev["metrics"]
 
@@ -652,9 +859,18 @@ def main() -> None:
     with label_map_path.open("w") as handle:
         json.dump(
             {
-                "type_to_label_norm": type_to_label,
+                "label_space": args.label_space,
+                "type_to_label_norm": exact_norm_to_label_idx,
+                "type_to_label_name": exact_norm_to_label_name,
                 "label_to_name": {str(k): v for k, v in label_to_name.items()},
-                "selected_qtypes_display": [label_to_name[type_to_label[t]] for t in selected_norms],
+                "label_key_to_idx": label_key_to_idx,
+                "selected_exact_qtypes_display": selected_exact_display,
+                "selected_labels_display": selected_labels_display,
+                "coarse_mapping_used": (
+                    {k: EXACT_TO_COARSE_KEY[k] for k in sorted(selected_exact_norms)}
+                    if args.label_space == "coarse5"
+                    else None
+                ),
             },
             handle,
             indent=2,
@@ -669,6 +885,13 @@ def main() -> None:
         "history": history,
         "saved_model_dir": str(out_dir),
         "label_map_path": str(label_map_path),
+        "train_rows_used": len(train_rows),
+        "dev_rows_used": len(dev_rows),
+        "train_label_distribution": count_by_label(train_rows),
+        "dev_label_distribution": count_by_label(dev_rows),
+        "train_exact_distribution": count_by_qtype(train_rows),
+        "dev_exact_distribution": count_by_qtype(dev_rows),
+        "dev_macro_recall_history_mean": mean([h["dev_macro_recall"] for h in history]),
     }
     summary_path = out_dir / "train_summary_qtype.json"
     with summary_path.open("w") as handle:
