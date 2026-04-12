@@ -237,7 +237,8 @@ def main() -> None:
     label_map_path = args.label_map_json or str(model_dir / "qtype_label_map.json")
     type_to_label_name = load_type_to_label_name(label_map_path) if Path(label_map_path).exists() else {}
 
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    # DebertaV2 fast tokenizer conversion may require protobuf in some HPC envs.
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), use_fast=False)
     model = AutoModelForSequenceClassification.from_pretrained(str(model_dir)).to(device)
     model.eval()
 
