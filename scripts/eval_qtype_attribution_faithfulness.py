@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Faithfulness evaluation for qtype attributions. "
-            "Compares IG vs Occlusion by masking top-k attributed tokens and measuring "
+            "Compares IG vs Occlusion vs Expected Gradients by masking top-k attributed tokens and measuring "
             "target-score drop."
         )
     )
@@ -176,25 +176,50 @@ def render_text_report(summary: Dict[str, Any]) -> str:
     for k_key in sorted(summary["by_k"].keys(), key=lambda x: int(x)):
         row = summary["by_k"][k_key]
         lines.append(f"--- k={k_key} ---")
-        lines.append(
-            "logit_drop_mean: "
-            f"IG={row['ig']['logit_drop']['mean']:.6f} "
-            f"OCC={row['occlusion']['logit_drop']['mean']:.6f} "
-            f"RAND={row['random']['logit_drop']['mean']:.6f}"
-        )
-        lines.append(
-            "prob_drop_mean:  "
-            f"IG={row['ig']['prob_drop']['mean']:.6f} "
-            f"OCC={row['occlusion']['prob_drop']['mean']:.6f} "
-            f"RAND={row['random']['prob_drop']['mean']:.6f}"
-        )
-        lines.append(
-            "paired_win_rate (higher drop wins): "
-            f"IG>{row['paired']['ig_beats_occ_rate']:.4f} "
-            f"OCC>{row['paired']['occ_beats_ig_rate']:.4f} "
-            f"ties={row['paired']['tie_rate']:.4f} "
-            f"(n={row['paired']['n']})"
-        )
+        has_eg = row.get("eg") is not None
+        if has_eg:
+            lines.append(
+                "logit_drop_mean: "
+                f"IG={row['ig']['logit_drop']['mean']:.6f} "
+                f"OCC={row['occlusion']['logit_drop']['mean']:.6f} "
+                f"EG={row['eg']['logit_drop']['mean']:.6f} "
+                f"RAND={row['random']['logit_drop']['mean']:.6f}"
+            )
+            lines.append(
+                "prob_drop_mean:  "
+                f"IG={row['ig']['prob_drop']['mean']:.6f} "
+                f"OCC={row['occlusion']['prob_drop']['mean']:.6f} "
+                f"EG={row['eg']['prob_drop']['mean']:.6f} "
+                f"RAND={row['random']['prob_drop']['mean']:.6f}"
+            )
+            lines.append(
+                "paired_win_rate (higher drop wins): "
+                f"IG>{row['paired']['ig_beats_occ_rate']:.4f} "
+                f"OCC>{row['paired']['occ_beats_ig_rate']:.4f} "
+                f"EG>{row['paired']['eg_beats_others_rate']:.4f} "
+                f"ties={row['paired']['tie_rate']:.4f} "
+                f"(n={row['paired']['n']})"
+            )
+        else:
+            lines.append(
+                "logit_drop_mean: "
+                f"IG={row['ig']['logit_drop']['mean']:.6f} "
+                f"OCC={row['occlusion']['logit_drop']['mean']:.6f} "
+                f"RAND={row['random']['logit_drop']['mean']:.6f}"
+            )
+            lines.append(
+                "prob_drop_mean:  "
+                f"IG={row['ig']['prob_drop']['mean']:.6f} "
+                f"OCC={row['occlusion']['prob_drop']['mean']:.6f} "
+                f"RAND={row['random']['prob_drop']['mean']:.6f}"
+            )
+            lines.append(
+                "paired_win_rate (higher drop wins): "
+                f"IG>{row['paired']['ig_beats_occ_rate']:.4f} "
+                f"OCC>{row['paired']['occ_beats_ig_rate']:.4f} "
+                f"ties={row['paired']['tie_rate']:.4f} "
+                f"(n={row['paired']['n']})"
+            )
         lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -230,10 +255,14 @@ def main() -> None:
             "ig_prob": [],
             "occ_logit": [],
             "occ_prob": [],
+            "eg_logit": [],
+            "eg_prob": [],
             "rand_logit": [],
             "rand_prob": [],
             "paired_ig_minus_occ_logit": [],
             "paired_ig_minus_occ_prob": [],
+            "paired_ig_minus_eg_logit": [],
+            "paired_occ_minus_eg_logit": [],
         }
         for k in ks
     }
@@ -286,10 +315,13 @@ def main() -> None:
 
         ig_items = row.get("ig_top_positive", []) or []
         occ_items = row.get("occlusion_top_positive", []) or []
+        eg_items = row.get("eg_top_positive", []) or []
 
         for k in ks:
             ig_idx = select_top_indices(ig_items, valid_positions, k, args.require_positive)
             occ_idx = select_top_indices(occ_items, valid_positions, k, args.require_positive)
+            eg_idx = select_top_indices(eg_items, valid_positions, k, args.require_positive)
+            has_eg = bool(eg_idx)
             if not ig_idx or not occ_idx:
                 continue
 
@@ -320,6 +352,20 @@ def main() -> None:
                 base_logit=base_logit,
                 base_prob=base_prob,
             )
+            eg_logit_drop = float("nan")
+            eg_prob_drop = float("nan")
+            if has_eg:
+                eg_logit_drop, eg_prob_drop = masked_drop(
+                    model=model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    target_idx=target_idx,
+                    indices=eg_idx,
+                    replace_id=replace_id,
+                    mode=args.mask_mode,
+                    base_logit=base_logit,
+                    base_prob=base_prob,
+                )
             rand_logit_drop, rand_prob_drop = masked_drop(
                 model=model,
                 input_ids=input_ids,
@@ -337,10 +383,16 @@ def main() -> None:
             d["ig_prob"].append(float(ig_prob_drop))
             d["occ_logit"].append(float(occ_logit_drop))
             d["occ_prob"].append(float(occ_prob_drop))
+            if has_eg:
+                d["eg_logit"].append(float(eg_logit_drop))
+                d["eg_prob"].append(float(eg_prob_drop))
             d["rand_logit"].append(float(rand_logit_drop))
             d["rand_prob"].append(float(rand_prob_drop))
             d["paired_ig_minus_occ_logit"].append(float(ig_logit_drop - occ_logit_drop))
             d["paired_ig_minus_occ_prob"].append(float(ig_prob_drop - occ_prob_drop))
+            if has_eg:
+                d["paired_ig_minus_eg_logit"].append(float(ig_logit_drop - eg_logit_drop))
+                d["paired_occ_minus_eg_logit"].append(float(occ_logit_drop - eg_logit_drop))
 
         n_used += 1
         if i % 100 == 0:
@@ -354,6 +406,31 @@ def main() -> None:
         ig_wins = sum(1 for x in paired_logit if x > 1e-12)
         occ_wins = sum(1 for x in paired_logit if x < -1e-12)
         ties = n_pair - ig_wins - occ_wins
+        has_eg = len(d["eg_logit"]) > 0
+
+        eg_section = None
+        eg_rate = float("nan")
+        if has_eg:
+            # Tri-method winner rate for EG: EG beats IG and OCC on same query.
+            # We can only compute where EG is present, so align by length via stored paired diffs.
+            n_eg = min(len(d["paired_ig_minus_eg_logit"]), len(d["paired_occ_minus_eg_logit"]))
+            eg_beats = 0
+            tie3 = 0
+            for ii in range(n_eg):
+                ig_minus_eg = d["paired_ig_minus_eg_logit"][ii]
+                occ_minus_eg = d["paired_occ_minus_eg_logit"][ii]
+                # EG wins if both IG and OCC drops are lower than EG drop.
+                if ig_minus_eg < -1e-12 and occ_minus_eg < -1e-12:
+                    eg_beats += 1
+                # tie bucket for near-equality cases across both comparisons.
+                elif abs(ig_minus_eg) <= 1e-12 and abs(occ_minus_eg) <= 1e-12:
+                    tie3 += 1
+            eg_rate = (eg_beats / n_eg) if n_eg else float("nan")
+            eg_section = {
+                "logit_drop": stat(d["eg_logit"]),
+                "prob_drop": stat(d["eg_prob"]),
+                "n": n_eg,
+            }
 
         by_k_summary[str(k)] = {
             "ig": {
@@ -364,6 +441,7 @@ def main() -> None:
                 "logit_drop": stat(d["occ_logit"]),
                 "prob_drop": stat(d["occ_prob"]),
             },
+            "eg": eg_section,
             "random": {
                 "logit_drop": stat(d["rand_logit"]),
                 "prob_drop": stat(d["rand_prob"]),
@@ -372,8 +450,11 @@ def main() -> None:
                 "n": n_pair,
                 "ig_minus_occ_logit": stat(d["paired_ig_minus_occ_logit"]),
                 "ig_minus_occ_prob": stat(d["paired_ig_minus_occ_prob"]),
+                "ig_minus_eg_logit": stat(d["paired_ig_minus_eg_logit"]) if has_eg else None,
+                "occ_minus_eg_logit": stat(d["paired_occ_minus_eg_logit"]) if has_eg else None,
                 "ig_beats_occ_rate": (ig_wins / n_pair) if n_pair else float("nan"),
                 "occ_beats_ig_rate": (occ_wins / n_pair) if n_pair else float("nan"),
+                "eg_beats_others_rate": eg_rate,
                 "tie_rate": (ties / n_pair) if n_pair else float("nan"),
             },
         }
