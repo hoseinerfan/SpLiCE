@@ -7,6 +7,70 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+DEFAULT_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "but",
+    "by",
+    "can",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "his",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "its",
+    "many",
+    "me",
+    "most",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "she",
+    "so",
+    "that",
+    "the",
+    "their",
+    "them",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "with",
+    "would",
+    "you",
+    "your",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -28,6 +92,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--top-k", type=int, default=25)
     parser.add_argument(
+        "--min-token-count",
+        type=int,
+        default=1,
+        help="Drop tokens that appear fewer than this count before ranking.",
+    )
+    parser.add_argument(
         "--keep-case",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -45,6 +115,12 @@ def parse_args() -> argparse.Namespace:
         default=12,
         help="How many confusion pairs to include in text output.",
     )
+    parser.add_argument(
+        "--drop-stopwords",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Drop common function words before aggregation.",
+    )
     return parser.parse_args()
 
 
@@ -60,7 +136,12 @@ def load_type_to_label_name(path: str) -> Dict[str, str]:
     return {str(k): str(v) for k, v in out.items()}
 
 
-def normalize_token(token: str, keep_case: bool, keep_non_alnum: bool) -> Optional[str]:
+def normalize_token(
+    token: str,
+    keep_case: bool,
+    keep_non_alnum: bool,
+    stopwords: Optional[set] = None,
+) -> Optional[str]:
     t = str(token)
     if t.startswith("##"):
         t = t[2:]
@@ -73,6 +154,8 @@ def normalize_token(token: str, keep_case: bool, keep_non_alnum: bool) -> Option
         return None
     if not keep_non_alnum and not re.search(r"[a-z0-9]", t):
         return None
+    if stopwords is not None and t in stopwords:
+        return None
     return t
 
 
@@ -81,9 +164,15 @@ def update_stats(
     items: List[Dict[str, Any]],
     keep_case: bool,
     keep_non_alnum: bool,
+    stopwords: Optional[set],
 ) -> None:
     for it in items:
-        token = normalize_token(it.get("token", ""), keep_case=keep_case, keep_non_alnum=keep_non_alnum)
+        token = normalize_token(
+            it.get("token", ""),
+            keep_case=keep_case,
+            keep_non_alnum=keep_non_alnum,
+            stopwords=stopwords,
+        )
         if not token:
             continue
         score = float(it.get("score", 0.0))
@@ -93,10 +182,17 @@ def update_stats(
         rec["abs_score_sum"] += abs(score)
 
 
-def top_tokens(stats: Dict[str, Dict[str, float]], top_k: int, prefer_positive: bool) -> List[Dict[str, Any]]:
+def top_tokens(
+    stats: Dict[str, Dict[str, float]],
+    top_k: int,
+    prefer_positive: bool,
+    min_token_count: int,
+) -> List[Dict[str, Any]]:
     rows = []
     for token, v in stats.items():
         count = float(v["count"])
+        if count < float(min_token_count):
+            continue
         score_sum = float(v["score_sum"])
         abs_sum = float(v["abs_score_sum"])
         mean_score = score_sum / max(count, 1.0)
@@ -206,6 +302,8 @@ def main() -> None:
 
     type_to_label_name = load_type_to_label_name(args.label_map_json)
 
+    stopwords = DEFAULT_STOPWORDS if args.drop_stopwords else None
+
     rows: List[Dict[str, Any]] = []
     with input_path.open("r") as handle:
         for line in handle:
@@ -226,6 +324,13 @@ def main() -> None:
         "n_rows": len(rows),
         "n_rows_with_gold_label": 0,
         "n_misclassified": 0,
+        "options": {
+            "top_k": args.top_k,
+            "min_token_count": args.min_token_count,
+            "drop_stopwords": args.drop_stopwords,
+            "keep_case": args.keep_case,
+            "keep_non_alnum": args.keep_non_alnum,
+        },
         "methods": {},
         "confusion_pairs": [],
     }
@@ -265,27 +370,75 @@ def main() -> None:
 
             bucket = ensure_bucket(mroot, "per_pred_class", pred_label)
             bucket["n_rows"] += 1
-            update_stats(bucket["positive_stats"], pos_items, args.keep_case, args.keep_non_alnum)
-            update_stats(bucket["negative_stats"], neg_items, args.keep_case, args.keep_non_alnum)
+            update_stats(
+                bucket["positive_stats"],
+                pos_items,
+                args.keep_case,
+                args.keep_non_alnum,
+                stopwords,
+            )
+            update_stats(
+                bucket["negative_stats"],
+                neg_items,
+                args.keep_case,
+                args.keep_non_alnum,
+                stopwords,
+            )
 
             if misclassified:
                 mis = mroot["misclassified"]
 
                 overall = mis["overall"]
                 overall["n_rows"] += 1
-                update_stats(overall["positive_stats"], pos_items, args.keep_case, args.keep_non_alnum)
-                update_stats(overall["negative_stats"], neg_items, args.keep_case, args.keep_non_alnum)
+                update_stats(
+                    overall["positive_stats"],
+                    pos_items,
+                    args.keep_case,
+                    args.keep_non_alnum,
+                    stopwords,
+                )
+                update_stats(
+                    overall["negative_stats"],
+                    neg_items,
+                    args.keep_case,
+                    args.keep_non_alnum,
+                    stopwords,
+                )
 
                 by_pred = ensure_bucket(mis, "by_pred_class", pred_label)
                 by_pred["n_rows"] += 1
-                update_stats(by_pred["positive_stats"], pos_items, args.keep_case, args.keep_non_alnum)
-                update_stats(by_pred["negative_stats"], neg_items, args.keep_case, args.keep_non_alnum)
+                update_stats(
+                    by_pred["positive_stats"],
+                    pos_items,
+                    args.keep_case,
+                    args.keep_non_alnum,
+                    stopwords,
+                )
+                update_stats(
+                    by_pred["negative_stats"],
+                    neg_items,
+                    args.keep_case,
+                    args.keep_non_alnum,
+                    stopwords,
+                )
 
                 pair = f"{gold_label} -> {pred_label}"
                 by_pair = ensure_bucket(mis, "by_confusion_pair", pair)
                 by_pair["n_rows"] += 1
-                update_stats(by_pair["positive_stats"], pos_items, args.keep_case, args.keep_non_alnum)
-                update_stats(by_pair["negative_stats"], neg_items, args.keep_case, args.keep_non_alnum)
+                update_stats(
+                    by_pair["positive_stats"],
+                    pos_items,
+                    args.keep_case,
+                    args.keep_non_alnum,
+                    stopwords,
+                )
+                update_stats(
+                    by_pair["negative_stats"],
+                    neg_items,
+                    args.keep_case,
+                    args.keep_non_alnum,
+                    stopwords,
+                )
 
     root["confusion_pairs"] = [
         {"pair": pair, "count": count}
@@ -296,18 +449,48 @@ def main() -> None:
         mroot = root["methods"][method]
 
         for _, obj in mroot["per_pred_class"].items():
-            obj["top_positive"] = top_tokens(obj.pop("positive_stats"), args.top_k, prefer_positive=True)
-            obj["top_negative"] = top_tokens(obj.pop("negative_stats"), args.top_k, prefer_positive=False)
+            obj["top_positive"] = top_tokens(
+                obj.pop("positive_stats"),
+                args.top_k,
+                prefer_positive=True,
+                min_token_count=args.min_token_count,
+            )
+            obj["top_negative"] = top_tokens(
+                obj.pop("negative_stats"),
+                args.top_k,
+                prefer_positive=False,
+                min_token_count=args.min_token_count,
+            )
 
         mis = mroot["misclassified"]
         overall = mis["overall"]
-        overall["top_positive"] = top_tokens(overall.pop("positive_stats"), args.top_k, prefer_positive=True)
-        overall["top_negative"] = top_tokens(overall.pop("negative_stats"), args.top_k, prefer_positive=False)
+        overall["top_positive"] = top_tokens(
+            overall.pop("positive_stats"),
+            args.top_k,
+            prefer_positive=True,
+            min_token_count=args.min_token_count,
+        )
+        overall["top_negative"] = top_tokens(
+            overall.pop("negative_stats"),
+            args.top_k,
+            prefer_positive=False,
+            min_token_count=args.min_token_count,
+        )
 
         for key in ["by_pred_class", "by_confusion_pair"]:
             for _, obj in mis[key].items():
-                obj["top_positive"] = top_tokens(obj.pop("positive_stats"), args.top_k, prefer_positive=True)
-                obj["top_negative"] = top_tokens(obj.pop("negative_stats"), args.top_k, prefer_positive=False)
+                obj["top_positive"] = top_tokens(
+                    obj.pop("positive_stats"),
+                    args.top_k,
+                    prefer_positive=True,
+                    min_token_count=args.min_token_count,
+                )
+                obj["top_negative"] = top_tokens(
+                    obj.pop("negative_stats"),
+                    args.top_k,
+                    prefer_positive=False,
+                    min_token_count=args.min_token_count,
+                )
 
     with output_json.open("w") as handle:
         json.dump(root, handle, indent=2)
