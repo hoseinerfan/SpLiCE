@@ -233,6 +233,8 @@ def fields_for_method(row: Dict[str, Any], method: str) -> Tuple[List[Dict[str, 
         return row.get("ig_top_positive", []) or [], row.get("ig_top_negative", []) or []
     if method == "occlusion":
         return row.get("occlusion_top_positive", []) or [], row.get("occlusion_top_negative", []) or []
+    if method == "eg":
+        return row.get("eg_top_positive", []) or [], row.get("eg_top_negative", []) or []
     raise ValueError(f"unsupported method: {method}")
 
 
@@ -252,7 +254,7 @@ def render_text_report(summary: Dict[str, Any], top_k: int, confusion_topn: int)
             lines.append(f"{row['pair']}: {row['count']}")
         lines.append("")
 
-    for method in ["ig", "occlusion"]:
+    for method in ["ig", "eg", "occlusion"]:
         if method not in summary["methods"]:
             continue
         m = summary["methods"][method]
@@ -316,6 +318,8 @@ def main() -> None:
     for row in rows:
         if "ig_top_positive" in row:
             methods_present.add("ig")
+        if "eg_top_positive" in row:
+            methods_present.add("eg")
         if "occlusion_top_positive" in row:
             methods_present.add("occlusion")
 

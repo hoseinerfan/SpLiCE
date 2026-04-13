@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,16 +13,25 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Token-level attribution for MMQA qtype classifiers using Integrated Gradients "
-            "and/or occlusion."
+            "and/or occlusion / expected gradients."
         )
     )
     parser.add_argument("--model-dir", type=str, required=True)
     parser.add_argument("--input-jsonl", type=str, required=True)
     parser.add_argument("--output-jsonl", type=str, required=True)
     parser.add_argument("--label-map-json", type=str, default="")
-    parser.add_argument("--method", type=str, default="both", choices=["ig", "occlusion", "both"])
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="both",
+        choices=["ig", "occlusion", "both", "eg", "all"],
+        help="both=IG+Occlusion, eg=Expected Gradients, all=IG+Occlusion+EG",
+    )
     parser.add_argument("--target", type=str, default="pred", choices=["pred", "gold"])
     parser.add_argument("--ig-steps", type=int, default=32)
+    parser.add_argument("--eg-steps", type=int, default=16)
+    parser.add_argument("--eg-baselines", type=int, default=4)
+    parser.add_argument("--eg-seed", type=int, default=42)
     parser.add_argument(
         "--occlusion-mode",
         type=str,
@@ -177,6 +187,70 @@ def integrated_gradients(
     return attributions.detach().cpu()
 
 
+def expected_gradients(
+    model: Any,
+    tokenizer: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    target_idx: int,
+    steps: int,
+    n_baselines: int,
+    baseline_id_pool: List[torch.Tensor],
+    rng: random.Random,
+    device: torch.device,
+) -> torch.Tensor:
+    if not baseline_id_pool:
+        # Fallback to plain IG baseline behavior when no pool is available.
+        return integrated_gradients(
+            model=model,
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            target_idx=target_idx,
+            steps=steps,
+            device=device,
+        )
+
+    embed_layer = model.get_input_embeddings()
+
+    ids = input_ids.to(device)
+    am = attention_mask.to(device)
+    emb = embed_layer(ids).detach()
+
+    special_mask = safe_special_mask(tokenizer, ids[0].detach().cpu().tolist())
+    special_mask_t = torch.tensor(special_mask, dtype=torch.bool, device=device).unsqueeze(0)
+
+    n_use = max(int(n_baselines), 1)
+    alphas = torch.linspace(0.0, 1.0, steps=max(int(steps), 1) + 1, device=device)[1:]
+
+    total_attr = torch.zeros(ids.shape[1], dtype=torch.float32, device=device)
+
+    for _ in range(n_use):
+        b_idx = rng.randrange(len(baseline_id_pool))
+        b_ids = baseline_id_pool[b_idx].to(device)
+        if b_ids.shape != ids.shape:
+            # Should not happen when max_length is fixed, but guard anyway.
+            b_ids = torch.full_like(ids, fill_value=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
+
+        baseline_ids = torch.where(special_mask_t, ids, b_ids)
+        baseline_emb = embed_layer(baseline_ids).detach()
+
+        total_grad = torch.zeros_like(emb)
+        for alpha in alphas:
+            x = baseline_emb + alpha * (emb - baseline_emb)
+            x.requires_grad_(True)
+            logits = model(inputs_embeds=x, attention_mask=am).logits
+            target_logit = logits[0, target_idx]
+            grad = torch.autograd.grad(target_logit, x, retain_graph=False, create_graph=False)[0]
+            total_grad += grad.detach()
+
+        avg_grad = total_grad / max(len(alphas), 1)
+        attr = ((emb - baseline_emb) * avg_grad).sum(dim=-1).squeeze(0)
+        total_attr += attr
+
+    return (total_attr / float(n_use)).detach().cpu()
+
+
 @torch.no_grad()
 def occlusion_scores(
     model: Any,
@@ -251,6 +325,22 @@ def main() -> None:
     print(f"method: {args.method}")
     print(f"target: {args.target}")
 
+    baseline_id_pool: List[torch.Tensor] = []
+    eg_rng = random.Random(args.eg_seed)
+    use_eg = args.method in {"eg", "all"}
+    use_ig = args.method in {"ig", "both", "all"}
+    use_occ = args.method in {"occlusion", "both", "all"}
+    if use_eg:
+        for row in rows:
+            b_enc = tokenizer(
+                row["query_text"],
+                truncation=True,
+                max_length=args.max_length,
+                return_tensors="pt",
+            )
+            baseline_id_pool.append(b_enc["input_ids"])
+        print(f"eg_baseline_pool_size: {len(baseline_id_pool)}")
+
     with output_path.open("w") as out_f:
         for i, row in enumerate(rows, start=1):
             enc = tokenizer(
@@ -299,7 +389,7 @@ def main() -> None:
                 "target_label_name": id2label[target_idx],
             }
 
-            if args.method in {"ig", "both"}:
+            if use_ig:
                 ig_scores = integrated_gradients(
                     model=model,
                     tokenizer=tokenizer,
@@ -325,7 +415,36 @@ def main() -> None:
                         for pos in range(len(tokens))
                     ]
 
-            if args.method in {"occlusion", "both"}:
+            if use_eg:
+                eg_scores = expected_gradients(
+                    model=model,
+                    tokenizer=tokenizer,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    target_idx=target_idx,
+                    steps=args.eg_steps,
+                    n_baselines=args.eg_baselines,
+                    baseline_id_pool=baseline_id_pool,
+                    rng=eg_rng,
+                    device=device,
+                )
+                eg_list = [float(x) for x in eg_scores.tolist()]
+                top_pos, top_neg = extract_top_tokens(tokens, eg_list, valid_positions, args.top_k)
+                record["eg_top_positive"] = top_pos
+                record["eg_top_negative"] = top_neg
+                if args.save_full_token_scores:
+                    record["eg_token_scores"] = [
+                        {
+                            "index": pos,
+                            "token": tokens[pos],
+                            "score": eg_list[pos],
+                            "is_special": bool(special_mask[pos]),
+                            "is_active": bool(int(attention_mask[0, pos].item()) == 1),
+                        }
+                        for pos in range(len(tokens))
+                    ]
+
+            if use_occ:
                 occ_scores = occlusion_scores(
                     model=model,
                     tokenizer=tokenizer,
