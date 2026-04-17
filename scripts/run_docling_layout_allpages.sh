@@ -20,6 +20,7 @@ Usage (multiple docs):
     --doc-ids-file /tmp/doc_ids.txt
 
 Optional:
+  --input-root /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings
   --output-root /mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings
   --pdf-root /mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/splits/pdfs_dev
   --run-tag allpages_docling_tfill_YYYYMMDD_HHMMSS
@@ -44,6 +45,7 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 DOC_ID=""
 DOC_IDS_FILE=""
+INPUT_ROOT=""
 OUTPUT_ROOT="/mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings"
 PDF_ROOT="/mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/splits/pdfs_dev"
 RUN_TAG="allpages_docling_tfill_$(date +%Y%m%d_%H%M%S)"
@@ -79,6 +81,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --doc-id) DOC_ID="$2"; shift 2 ;;
     --doc-ids-file) DOC_IDS_FILE="$2"; shift 2 ;;
+    --input-root) INPUT_ROOT="$2"; shift 2 ;;
     --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
     --pdf-root) PDF_ROOT="$2"; shift 2 ;;
     --run-tag) RUN_TAG="$2"; shift 2 ;;
@@ -97,6 +100,10 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+if [[ -z "${INPUT_ROOT}" ]]; then
+  INPUT_ROOT="${OUTPUT_ROOT}"
+fi
 
 if [[ -z "${DOC_ID}" && -z "${DOC_IDS_FILE}" ]]; then
   echo "ERROR: provide --doc-id or --doc-ids-file" >&2
@@ -124,6 +131,7 @@ else
 fi
 
 echo "Docs: ${#DOC_IDS[@]}"
+echo "Input root: ${INPUT_ROOT}"
 echo "Output root: ${OUTPUT_ROOT}"
 echo "Run tag: ${RUN_TAG}"
 
@@ -133,12 +141,12 @@ for DOC in "${DOC_IDS[@]}"; do
   echo "DOC: ${DOC}"
   echo "===================="
 
-  CTX="${OUTPUT_ROOT}/debug_${DOC}_linked_context_auto"
+  CTX="${INPUT_ROOT}/debug_${DOC}_linked_context_auto"
   PDF="${PDF_ROOT}/${DOC}.pdf"
-  IMG_ROOT="${OUTPUT_ROOT}/debug_${DOC}_page_pngs_144"
+  IMG_ROOT="${INPUT_ROOT}/debug_${DOC}_page_pngs_144"
   BASE_LABELS="${CTX}/doc_seed_text_patch_labels.jsonl"
 
-  OUTDIR="${CTX}/${RUN_TAG}"
+  OUTDIR="${OUTPUT_ROOT}/debug_${DOC}_linked_context_auto/${RUN_TAG}"
   mkdir -p "${OUTDIR}"
 
   if [[ ! -f "${BASE_LABELS}" || ! -f "${PDF}" ]]; then
