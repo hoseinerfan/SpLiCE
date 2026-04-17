@@ -507,7 +507,7 @@ def main() -> None:
     device = torch.device(args.device)
     use_bf16 = bool(args.bf16 and device.type == "cuda")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name,
         num_labels=2,
