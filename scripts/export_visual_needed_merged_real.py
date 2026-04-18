@@ -3,7 +3,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Set
 
 
 POS_LABEL_NAME = "visual_needed"
@@ -93,17 +93,24 @@ DEFAULT_VISUAL_LEXICON = {
     "animals",
     "arch",
     "archway",
+    "arm",
+    "arms",
     "artwork",
+    "background",
+    "bald",
+    "ball",
+    "balls",
     "banner",
     "beard",
     "billboard",
     "billboards",
-    "bald",
-    "ball",
-    "balls",
     "blanket",
     "blankets",
     "body",
+    "boy",
+    "boys",
+    "bridge",
+    "bridges",
     "building",
     "buildings",
     "clothing",
@@ -112,11 +119,15 @@ DEFAULT_VISUAL_LEXICON = {
     "color",
     "colors",
     "colour",
-    "cover",
-    "covers",
-    "covering",
     "column",
     "columns",
+    "concert",
+    "concerts",
+    "cover",
+    "covering",
+    "covers",
+    "crowd",
+    "crowds",
     "dress",
     "dressed",
     "emblem",
@@ -124,14 +135,20 @@ DEFAULT_VISUAL_LEXICON = {
     "face",
     "faces",
     "facial",
+    "female",
     "flag",
     "flags",
     "floating",
     "flower",
     "flowers",
+    "foreground",
     "forehead",
     "front",
+    "girl",
+    "girls",
     "glasses",
+    "gymnast",
+    "gymnasts",
     "hair",
     "hand",
     "hands",
@@ -146,13 +163,20 @@ DEFAULT_VISUAL_LEXICON = {
     "indoor",
     "jacket",
     "jersey",
+    "jockey",
+    "lake",
+    "lakes",
     "left",
+    "lineup",
+    "lineups",
     "live",
     "location",
     "locations",
     "logo",
     "logos",
+    "male",
     "man",
+    "men",
     "metal",
     "mountain",
     "mountains",
@@ -166,12 +190,12 @@ DEFAULT_VISUAL_LEXICON = {
     "outdoor",
     "park",
     "parks",
-    "person",
     "people",
+    "person",
     "photo",
-    "photos",
     "photograph",
     "photographs",
+    "photos",
     "picture",
     "pictures",
     "player",
@@ -181,9 +205,9 @@ DEFAULT_VISUAL_LEXICON = {
     "race",
     "racehorse",
     "racehorses",
-    "reddish",
     "rectangle",
     "rectangular",
+    "reddish",
     "right",
     "river",
     "rivers",
@@ -191,12 +215,15 @@ DEFAULT_VISUAL_LEXICON = {
     "roses",
     "scene",
     "scenes",
+    "sculpture",
+    "sculptures",
     "shape",
     "shaped",
     "shapes",
     "shirt",
-    "shore",
     "shiny",
+    "shore",
+    "shoreline",
     "show",
     "shown",
     "shows",
@@ -211,27 +238,32 @@ DEFAULT_VISUAL_LEXICON = {
     "standing",
     "statue",
     "statues",
-    "stiped",
     "striped",
     "structure",
     "structures",
     "symbol",
     "symbols",
+    "theater",
     "theatre",
     "title",
     "titles",
     "top",
+    "track",
+    "tracks",
     "tree",
     "trees",
+    "unzipped",
     "visible",
     "visual",
     "water",
+    "waterfront",
     "wear",
     "wearing",
     "wears",
     "white",
+    "woman",
+    "women",
     "zipped",
-    "unzipped",
 }
 
 
@@ -395,6 +427,11 @@ def collect_visual_phrases_and_tokens(
         norm = normalize_token(token_row.get("norm", raw))
         if raw and norm and norm not in surface_by_norm:
             surface_by_norm[norm] = raw
+    for raw in query_word_tokens(str(row.get("query_text", ""))):
+        norm = normalize_token(raw)
+        if raw and norm and norm not in surface_by_norm:
+            surface_by_norm[norm] = raw
+
     surfaced = [surface_by_norm.get(normalize_token(tok), str(tok).strip()) for tok in visual_tokens]
 
     return {
@@ -439,7 +476,7 @@ def main() -> None:
                 rows_with_any_cues += 1
             else:
                 rows_missing_any_cues += 1
-                if target_visual and not args.keep_empty-target-rows:
+                if target_visual and not args.keep_empty_target_rows:
                     continue
 
             out_row = {
