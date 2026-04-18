@@ -85,29 +85,56 @@ VISUAL_GOLD_QTYPES = {
 }
 
 DEFAULT_VISUAL_LEXICON = {
+    "ad",
+    "advertisement",
+    "advertisements",
+    "amusement",
     "animal",
     "animals",
+    "arch",
+    "archway",
+    "artwork",
     "banner",
     "beard",
     "billboard",
+    "billboards",
     "bald",
+    "ball",
+    "balls",
     "blanket",
+    "blankets",
+    "body",
+    "building",
+    "buildings",
+    "clothing",
     "coat",
+    "collage",
     "color",
+    "colors",
     "colour",
     "cover",
     "covers",
+    "covering",
+    "column",
+    "columns",
     "dress",
     "dressed",
     "emblem",
+    "entrance",
     "face",
     "faces",
     "facial",
     "flag",
+    "flags",
+    "floating",
     "flower",
     "flowers",
+    "forehead",
+    "front",
     "glasses",
     "hair",
+    "hand",
+    "hands",
     "holding",
     "holds",
     "horse",
@@ -116,40 +143,95 @@ DEFAULT_VISUAL_LEXICON = {
     "icons",
     "image",
     "images",
+    "indoor",
+    "jacket",
     "jersey",
+    "left",
+    "live",
+    "location",
+    "locations",
     "logo",
     "logos",
+    "man",
+    "metal",
+    "mountain",
+    "mountains",
+    "movie",
+    "movies",
     "mule",
     "mules",
     "mustache",
+    "object",
+    "objects",
+    "outdoor",
+    "park",
+    "parks",
+    "person",
+    "people",
     "photo",
     "photos",
     "photograph",
     "photographs",
     "picture",
     "pictures",
+    "player",
+    "players",
     "poster",
     "posters",
+    "race",
     "racehorse",
     "racehorses",
+    "reddish",
+    "rectangle",
+    "rectangular",
+    "right",
+    "river",
+    "rivers",
     "rose",
     "roses",
+    "scene",
+    "scenes",
     "shape",
+    "shaped",
     "shapes",
     "shirt",
+    "shore",
+    "shiny",
+    "show",
+    "shown",
+    "shows",
     "sign",
     "signs",
-    "sideburns",
+    "sitting",
+    "sleeve",
+    "sleeves",
     "sport",
     "sports",
+    "stage",
+    "standing",
+    "statue",
+    "statues",
+    "stiped",
+    "striped",
+    "structure",
+    "structures",
     "symbol",
     "symbols",
+    "theatre",
     "title",
     "titles",
+    "top",
+    "tree",
+    "trees",
+    "visible",
     "visual",
+    "water",
     "wear",
     "wearing",
     "wears",
+    "white",
+    "zipped",
+    "unzipped",
 }
 
 
@@ -271,13 +353,15 @@ def collect_visual_phrases_and_tokens(
     visual_lexicon: Set[str],
 ) -> Dict[str, List[str]]:
     visual_phrases: List[str] = []
-    phrase_tokens: List[str] = []
+    phrase_token_norms: List[str] = []
 
     for phrase_row in row.get("phrase_labels", []) or []:
         norm_tokens = [normalize_token(tok) for tok in (phrase_row.get("norm_tokens") or [])]
-        hit_tokens = [tok for tok in norm_tokens if tok and visual_hits(tok, visual_lexicon)]
+        norm_tokens = [tok for tok in norm_tokens if tok and tok not in DEFAULT_STOPWORDS]
+        hit_tokens = [tok for tok in norm_tokens if visual_hits(tok, visual_lexicon)]
         if not hit_tokens:
             continue
+
         raw_examples = phrase_row.get("raw_examples") or []
         if raw_examples:
             visual_phrases.extend(str(x).strip() for x in raw_examples if str(x).strip())
@@ -285,20 +369,26 @@ def collect_visual_phrases_and_tokens(
             norm_phrase = str(phrase_row.get("norm_phrase", "")).strip()
             if norm_phrase:
                 visual_phrases.append(norm_phrase)
-        phrase_tokens.extend(hit_tokens)
+
+        # Once a phrase is genuinely visual, propagate all of its normalized tokens.
+        phrase_token_norms.extend(norm_tokens)
+
+    phrase_token_norms = uniq_keep_order(phrase_token_norms)
+    phrase_token_norm_set = set(phrase_token_norms)
 
     visual_tokens: List[str] = []
     for token_row in row.get("token_labels", []) or []:
         raw = str(token_row.get("token", "")).strip()
         norm = normalize_token(token_row.get("norm", raw))
         important = bool(token_row.get("important"))
-        if raw and norm and important and visual_hits(norm, visual_lexicon):
+        if not raw or not norm or not important:
+            continue
+        if visual_hits(norm, visual_lexicon) or norm in phrase_token_norm_set:
             visual_tokens.append(raw)
 
-    # Add lexicon-hit tokens that appear inside visual phrases, even if token-level attribution missed them.
-    visual_tokens.extend(phrase_tokens)
+    # Add propagated phrase tokens as tokens too, keeping them real and attribution-derived.
+    visual_tokens.extend(phrase_token_norms)
 
-    # Prefer surface tokens from token_labels when possible; otherwise keep normalized phrase tokens.
     surface_by_norm: Dict[str, str] = {}
     for token_row in row.get("token_labels", []) or []:
         raw = str(token_row.get("token", "")).strip()
@@ -349,7 +439,7 @@ def main() -> None:
                 rows_with_any_cues += 1
             else:
                 rows_missing_any_cues += 1
-                if target_visual and not args.keep_empty_target_rows:
+                if target_visual and not args.keep_empty-target-rows:
                     continue
 
             out_row = {
