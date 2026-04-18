@@ -159,10 +159,31 @@ def parse_args() -> argparse.Namespace:
         help="Minimum normalized token length kept in phrase/pair aggregation.",
     )
     parser.add_argument(
+        "--min-span-norm-tokens",
+        type=int,
+        default=2,
+        help=(
+            "Minimum number of normalized tokens required for a kept span. "
+            "Set to 2 to keep phrase-like spans only."
+        ),
+    )
+    parser.add_argument(
         "--min-pattern-count",
         type=int,
         default=2,
         help="Minimum aggregated frequency for a phrase/pair to be reported.",
+    )
+    parser.add_argument(
+        "--save-raw-span-audit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store per-query kept spans with raw contiguous text in output JSON for auditing.",
+    )
+    parser.add_argument(
+        "--raw-span-audit-max-rows",
+        type=int,
+        default=20000,
+        help="Maximum number of per-query raw span audit rows stored in output JSON.",
     )
     parser.add_argument("--top-k-patterns", type=int, default=20)
     return parser.parse_args()
@@ -395,6 +416,8 @@ def main() -> None:
     global_span_stats: Dict[str, Dict[str, float]] = {}
     by_pred: Dict[str, Dict[str, Any]] = {}
     by_conf: Dict[str, Dict[str, Any]] = {}
+    raw_span_audit_rows: List[Dict[str, Any]] = []
+    raw_span_audit_truncated = False
 
     n_used = 0
     n_skipped = 0
@@ -554,13 +577,38 @@ def main() -> None:
                 t = normalize_token(tokens[p], stopwords, args.drop_numeric_only, args.min_token_len)
                 if t:
                     norm_tokens.append(t)
-            if not norm_tokens:
+            if len(norm_tokens) < max(1, args.min_span_norm_tokens):
                 continue
             phrase = " ".join(norm_tokens)
             add_agg(global_span_stats, phrase, drop_val)
             add_agg(pred_rec["span_stats"], phrase, drop_val)
             if conf_rec is not None:
                 add_agg(conf_rec["span_stats"], phrase, drop_val)
+            if args.save_raw_span_audit:
+                if len(raw_span_audit_rows) < max(0, args.raw_span_audit_max_rows):
+                    raw_span = tokenizer.decode(
+                        ids[0, start : end + 1].tolist(),
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    ).strip()
+                    raw_span_audit_rows.append(
+                        {
+                            "query_id": qid,
+                            "query_text": qtext,
+                            "pred_label_name": pred_label,
+                            "gold_label_name": gold_label,
+                            "confusion_pair": conf_key,
+                            "target_label_idx": target_idx,
+                            "span_start": start,
+                            "span_end": end,
+                            "raw_span": raw_span,
+                            "norm_span": phrase,
+                            "norm_token_count": len(norm_tokens),
+                            "drop_logit": float(drop_val),
+                        }
+                    )
+                else:
+                    raw_span_audit_truncated = True
 
         n_used += 1
         if i % 50 == 0:
@@ -582,9 +630,12 @@ def main() -> None:
             "drop_stopwords": args.drop_stopwords,
             "drop_numeric_only": args.drop_numeric_only,
             "min_token_len": args.min_token_len,
+            "min_span_norm_tokens": args.min_span_norm_tokens,
             "min_pattern_count": args.min_pattern_count,
             "top_k_patterns": args.top_k_patterns,
             "require_positive_top_tokens": args.require_positive_top_tokens,
+            "save_raw_span_audit": args.save_raw_span_audit,
+            "raw_span_audit_max_rows": args.raw_span_audit_max_rows,
         },
         "n_rows_total": len(rows),
         "n_rows_used": n_used,
@@ -608,6 +659,14 @@ def main() -> None:
             "n_rows": rec["n_rows"],
             "top_pairs": finalize_agg(rec["pair_stats"], args.min_pattern_count, args.top_k_patterns),
             "top_spans": finalize_agg(rec["span_stats"], args.min_pattern_count, args.top_k_patterns),
+        }
+
+    if args.save_raw_span_audit:
+        summary["raw_span_audit"] = {
+            "n_rows": len(raw_span_audit_rows),
+            "truncated": raw_span_audit_truncated,
+            "max_rows": args.raw_span_audit_max_rows,
+            "rows": raw_span_audit_rows,
         }
 
     with out_json.open("w") as handle:
