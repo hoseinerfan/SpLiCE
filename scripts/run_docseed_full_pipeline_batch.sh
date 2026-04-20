@@ -151,20 +151,20 @@ for DOC in "${DOC_IDS[@]}"; do
   IMG_DIR="${OUTPUT_ROOT}/debug_${DOC}_page_pngs_144"
 
   if [[ ! -f "${TXT_DICT}" || ! -f "${TXT_VOC}" ]]; then
-    echo "ERROR: missing doc-seed text dictionary for ${DOC} under ${CTX}" >&2
-    exit 1
+    echo "WARN: missing doc-seed text dictionary for ${DOC} under ${CTX}; skipping doc" >&2
+    continue
   fi
   if [[ ! -f "${EMB_PATH}" ]]; then
-    echo "ERROR: missing embeddings file: ${EMB_PATH}" >&2
-    exit 1
+    echo "WARN: missing embeddings file: ${EMB_PATH}; skipping doc" >&2
+    continue
   fi
   if [[ ! -f "${VIS_LAB}" ]]; then
-    echo "ERROR: missing visual labels file: ${VIS_LAB}" >&2
-    exit 1
+    echo "WARN: missing visual labels file: ${VIS_LAB}; skipping doc" >&2
+    continue
   fi
   if [[ ! -f "${PDF_PATH}" ]]; then
-    echo "ERROR: missing PDF file: ${PDF_PATH}" >&2
-    exit 1
+    echo "WARN: missing PDF file: ${PDF_PATH}; skipping doc" >&2
+    continue
   fi
 
   # Stage 2: text patch labeling
