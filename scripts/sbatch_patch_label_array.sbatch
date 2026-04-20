@@ -21,7 +21,8 @@ Each batch file should contain one doc id per line.
 
 Typical usage:
   sbatch --array=0-9%4 scripts/sbatch_patch_label_array.sbatch \
-    --batch-root /mmfs1/scratch/jacks.local/aerfanshekooh/custom/slurm/patch_labels_remaining
+    --batch-root /mmfs1/scratch/jacks.local/aerfanshekooh/custom/slurm/patch_labels_remaining \
+    --repo-root /mmfs1/scratch/jacks.local/aerfanshekooh/repos/SpLiCE
 
 Optional overrides:
   --batch-pattern 'batch_*.txt'
@@ -43,12 +44,13 @@ Notes:
 - The script uses the current repo checkout to run the pipeline.
 - It assumes the repo-relative virtualenv exists at m3docrag/.venv.
 - It always uses --skip-ocr-stages and --skip-existing for the docseed stage.
+- Under Slurm, the script prefers SLURM_SUBMIT_DIR and also accepts --repo-root to avoid resolving the repo from the staged spool copy.
 EOF
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-cd "${REPO_ROOT}"
+DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="${SLURM_SUBMIT_DIR:-${DEFAULT_REPO_ROOT}}"
 
 BATCH_ROOT=""
 BATCH_PATTERN="batch_*.txt"
@@ -84,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --docling-device) DOCLING_DEVICE="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --logs-dir) LOGS_DIR="$2"; shift 2 ;;
+    --repo-root) REPO_ROOT="$2"; shift 2 ;;
     --task-index) TASK_INDEX="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -95,6 +98,11 @@ if [[ -z "${BATCH_ROOT}" ]]; then
   usage
   exit 2
 fi
+if [[ ! -d "${REPO_ROOT}/scripts" ]]; then
+  echo "ERROR: repo root is invalid: ${REPO_ROOT}" >&2
+  exit 2
+fi
+cd "${REPO_ROOT}"
 if [[ ! -d "${BATCH_ROOT}" ]]; then
   echo "ERROR: batch root not found: ${BATCH_ROOT}" >&2
   exit 2
