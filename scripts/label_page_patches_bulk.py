@@ -3,12 +3,13 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
-from splice.model import SPLICE
+if TYPE_CHECKING:
+    from splice.model import SPLICE
 
 try:
     import numpy as np
@@ -235,7 +236,7 @@ def encode_scores_cosine(
 
 def encode_scores_splice(
     patch_vectors: torch.Tensor,
-    model: SPLICE,
+    model: "SPLICE",
     batch_size: int,
     positive_only: bool,
 ) -> torch.Tensor:
@@ -258,7 +259,7 @@ def process_file(
     dictionary_cpu: torch.Tensor,
     mean_cpu: torch.Tensor,
     args: argparse.Namespace,
-    model: Optional[SPLICE],
+    model: Optional["SPLICE"],
 ) -> Tuple[int, int]:
     obj = load_object(input_file)
     pages = extract_pages(obj, base_id=input_file.stem)
@@ -345,8 +346,10 @@ def main() -> None:
     if args.max_files > 0:
         sharded_files = sharded_files[: args.max_files]
 
-    model: Optional[SPLICE] = None
+    model: Optional["SPLICE"] = None
     if args.method == "splice":
+        from splice.model import SPLICE
+
         model = SPLICE(
             image_mean=mean_cpu,
             dictionary=dictionary_cpu,
