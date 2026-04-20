@@ -446,7 +446,12 @@ def select_attribution_augmented_indices(
     if not candidates:
         return []
 
-    pool = [c for c in candidates if c["same_clause_anchor"]] or candidates
+    if anchor_clauses:
+        pool = [c for c in candidates if c["same_clause_anchor"]]
+        if not pool:
+            return []
+    else:
+        pool = candidates
     selected: List[int] = []
     selected_set: Set[int] = set()
 
