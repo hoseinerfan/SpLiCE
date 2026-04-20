@@ -30,6 +30,7 @@ Usage:
     [--dtype bfloat16] \
     [--fallback-text-ids-max 8] \
     [--no-strict-query-overlap] \
+    [--skip-ocr-stages] \
     [--skip-existing]
 EOF
 }
@@ -57,6 +58,7 @@ DTYPE="bfloat16"
 DEVICE="cuda:0"
 FALLBACK_TEXT_IDS_MAX="8"
 STRICT_QUERY_OVERLAP=1
+SKIP_OCR_STAGES=0
 SKIP_EXISTING=0
 
 while [[ $# -gt 0 ]]; do
@@ -78,6 +80,7 @@ while [[ $# -gt 0 ]]; do
     --device) DEVICE="$2"; shift 2 ;;
     --fallback-text-ids-max) FALLBACK_TEXT_IDS_MAX="$2"; shift 2 ;;
     --no-strict-query-overlap) STRICT_QUERY_OVERLAP=0; shift ;;
+    --skip-ocr-stages) SKIP_OCR_STAGES=1; shift ;;
     --skip-existing) SKIP_EXISTING=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -205,7 +208,7 @@ for DOC in "${DOC_IDS[@]}"; do
       --include-visual-only
   fi
 
-  # Stage 4: render pages for OCR
+  # Stage 4: render pages for OCR / Docling prerequisites
   mkdir -p "${IMG_DIR}"
   if [[ "${SKIP_EXISTING}" -eq 1 && -f "${IMG_DIR}/${DOC}_0.png" ]]; then
     echo "skip PDF render (images exist): ${IMG_DIR}"
@@ -221,6 +224,11 @@ for i, im in enumerate(pages):
     im.save(f"{img_dir}/{doc}_{i}.png")
 print("rendered_pages", len(pages))
 PY
+  fi
+
+  if [[ "${SKIP_OCR_STAGES}" -eq 1 ]]; then
+    wc -l "${TXT_LAB}" "${MERGED}"
+    continue
   fi
 
   # Number of pages from merged labels.
