@@ -631,61 +631,71 @@ def main() -> None:
             q_jsonl = doc_dir / "doc_seed_text_queries.jsonl"
             emb_dir = doc_dir / "doc_seed_text_query_emb"
             dict_pt = doc_dir / "doc_seed_text_dict.pt"
-
-            run_cmd(
-                [
-                    sys.executable,
-                    "scripts/concepts_to_queries_jsonl.py",
-                    "--concepts-txt",
-                    str(strict_path),
-                    "--output-jsonl",
-                    str(q_jsonl),
-                ]
-            )
-            run_cmd(
-                [
-                    sys.executable,
-                    "scripts/embed_colpali_queries.py",
-                    "--input-jsonl",
-                    str(q_jsonl),
-                    "--output-dir",
-                    str(emb_dir),
-                    "--model-name",
-                    args.model_name,
-                    "--backend",
-                    args.backend,
-                    "--query-id-field",
-                    "query_id",
-                    "--query-text-field",
-                    "query_text",
-                    "--batch-size",
-                    str(args.batch_size),
-                    "--dtype",
-                    args.dtype,
-                    "--device",
-                    args.device,
-                    "--skip-existing",
-                ]
-            )
-            run_cmd(
-                [
-                    sys.executable,
-                    "scripts/build_dictionary_from_concept_embeddings.py",
-                    "--embeddings-path",
-                    str(emb_dir),
-                    "--concept-jsonl",
-                    str(q_jsonl),
-                    "--output-dictionary-pt",
-                    str(dict_pt),
-                    "--output-vocab-txt",
-                    str(strict_path),
-                    "--recursive",
-                    "--normalize",
-                    "--expected-dim",
-                    str(args.expected_dim),
-                ]
-            )
-            summary["dictionary_path"] = str(dict_pt)
+            if not strict_concepts:
+                summary["dictionary_skipped_reason"] = "no_strict_concepts"
+            else:
+                run_cmd(
+                    [
+                        sys.executable,
+                        "scripts/concepts_to_queries_jsonl.py",
+                        "--concepts-txt",
+                        str(strict_path),
+                        "--output-jsonl",
+                        str(q_jsonl),
+                    ]
+                )
+                query_rows = 0
+                with open(q_jsonl, "r") as handle:
+                    for line in handle:
+                        if line.strip():
+                            query_rows += 1
+                if query_rows <= 0:
+                    summary["dictionary_skipped_reason"] = "no_valid_queries"
+                else:
+                    run_cmd(
+                        [
+                            sys.executable,
+                            "scripts/embed_colpali_queries.py",
+                            "--input-jsonl",
+                            str(q_jsonl),
+                            "--output-dir",
+                            str(emb_dir),
+                            "--model-name",
+                            args.model_name,
+                            "--backend",
+                            args.backend,
+                            "--query-id-field",
+                            "query_id",
+                            "--query-text-field",
+                            "query_text",
+                            "--batch-size",
+                            str(args.batch_size),
+                            "--dtype",
+                            args.dtype,
+                            "--device",
+                            args.device,
+                            "--skip-existing",
+                        ]
+                    )
+                    run_cmd(
+                        [
+                            sys.executable,
+                            "scripts/build_dictionary_from_concept_embeddings.py",
+                            "--embeddings-path",
+                            str(emb_dir),
+                            "--concept-jsonl",
+                            str(q_jsonl),
+                            "--output-dictionary-pt",
+                            str(dict_pt),
+                            "--output-vocab-txt",
+                            str(strict_path),
+                            "--recursive",
+                            "--normalize",
+                            "--expected-dim",
+                            str(args.expected_dim),
+                        ]
+                    )
+                    summary["dictionary_path"] = str(dict_pt)
 
         with open(doc_dir / "summary.json", "w") as handle:
             json.dump(summary, handle, indent=2)
@@ -700,6 +710,8 @@ def main() -> None:
             "strict_concepts_count",
         ]:
             print(f"{k}: {summary[k]}")
+        if "dictionary_skipped_reason" in summary:
+            print(f"dictionary_skipped_reason: {summary['dictionary_skipped_reason']}")
         print(f"Output dir: {doc_dir}")
 
 
