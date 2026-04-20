@@ -73,6 +73,23 @@ DEFAULT_STOPWORDS = {
 
 DEFAULT_ARTIFACT_TOKENS = {"s", "t", "p", "unc", "ing", "ed", "ly"}
 
+DEFAULT_ATTRIBUTION_FALLBACK_BLOCKLIST = {
+    "among",
+    "around",
+    "inside",
+    "outside",
+    "across",
+    "between",
+    "through",
+    "toward",
+    "towards",
+    "into",
+    "onto",
+    "from",
+    "there",
+    "here",
+}
+
 DEFAULT_VISUAL_LEXICON = {
     "logo",
     "poster",
@@ -103,6 +120,19 @@ DEFAULT_VISUAL_LEXICON = {
 
 NEG_LABEL_NAME = "non_visual_needed"
 POS_LABEL_NAME = "visual_needed"
+
+VISUAL_GOLD_QTYPES = {
+    "imageq",
+    "imagelistq",
+    "compose(tableq,imagelistq)",
+    "compose(textq,imagelistq)",
+    "compose(imageq,tableq)",
+    "compose(imageq,textq)",
+    "intersect(imagelistq,tableq)",
+    "intersect(imagelistq,textq)",
+    "compare(compose(tableq,imageq),tableq)",
+    "compare(compose(tableq,imageq),compose(tableq,textq))",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,6 +179,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--artifact-tokens", type=str, default="")
     parser.add_argument("--visual-lexicon", type=str, default="")
     parser.add_argument("--visual-lexicon-file", type=str, default="")
+    parser.add_argument(
+        "--augment-visual-tokens-from-attribution",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, also emit attribution-augmented visual token fields for target visual queries. "
+            "This does not overwrite the strict label field."
+        ),
+    )
+    parser.add_argument(
+        "--augment-target",
+        type=str,
+        default="pred",
+        choices=["pred", "gold", "any"],
+        help="Which rows are eligible for attribution-based token augmentation.",
+    )
+    parser.add_argument(
+        "--augment-max-tokens",
+        type=int,
+        default=2,
+        help="Max number of additional attribution-driven visual tokens to surface per query.",
+    )
     return parser.parse_args()
 
 
@@ -170,6 +222,10 @@ def parse_csv_set(raw: str) -> Set[str]:
         if token:
             out.add(token)
     return out
+
+
+def normalize_qtype_name(raw: Any) -> str:
+    return "".join(str(raw).strip().lower().split())
 
 
 def read_list_file(path: str) -> Set[str]:
@@ -206,6 +262,19 @@ def field_name(method: str) -> str:
     return f"{method_name}_top_positive"
 
 
+def visual_lexicon_hit(token: str, visual_lexicon: Set[str]) -> bool:
+    if not token:
+        return False
+    candidates = {token}
+    if len(token) > 3 and token.endswith("s"):
+        candidates.add(token[:-1])
+    if len(token) > 4 and token.endswith("es"):
+        candidates.add(token[:-2])
+    if len(token) > 4 and token.endswith("ies"):
+        candidates.add(token[:-3] + "y")
+    return any(x in visual_lexicon for x in candidates)
+
+
 def collect_method_tokens(
     row: Dict[str, Any],
     methods: Sequence[str],
@@ -227,6 +296,34 @@ def collect_method_tokens(
             if artifact_tokens is not None and token in artifact_tokens:
                 continue
             vals.add(token)
+        out[method] = vals
+    return out
+
+
+def collect_method_token_scores(
+    row: Dict[str, Any],
+    methods: Sequence[str],
+    min_token_len: int,
+    stopwords: Optional[Set[str]],
+    artifact_tokens: Optional[Set[str]],
+) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for method in methods:
+        vals: Dict[str, float] = {}
+        for item in row.get(field_name(method), []) or []:
+            token = normalize_token(item.get("token", ""))
+            if not token:
+                continue
+            if len(token) < max(1, min_token_len):
+                continue
+            if stopwords is not None and token in stopwords:
+                continue
+            if artifact_tokens is not None and token in artifact_tokens:
+                continue
+            score = float(item.get("score", 0.0))
+            prev = vals.get(token)
+            if prev is None or score > prev:
+                vals[token] = score
         out[method] = vals
     return out
 
@@ -259,7 +356,7 @@ def classify_query_tokens_binary(
     for idx, raw in enumerate(raw_tokens):
         norm = normalize_token(raw)
         important = bool(norm and norm in influential)
-        visual_hit = bool(norm and norm in visual_lexicon)
+        visual_hit = bool(norm and visual_lexicon_hit(norm, visual_lexicon))
         label = POS_LABEL_NAME if important and visual_hit else NEG_LABEL_NAME
 
         row = {
@@ -283,6 +380,96 @@ def classify_query_tokens_binary(
             non_visual_indices.append(idx)
 
     return token_rows, visual_indices, non_visual_indices
+
+
+def row_is_target_visual(row: Dict[str, Any], target: str) -> bool:
+    pred_visual = str(row.get("pred_label_name", "")).strip() == POS_LABEL_NAME
+    gold_visual = normalize_qtype_name(row.get("gold_qtype", "")) in VISUAL_GOLD_QTYPES
+    if target == "pred":
+        return pred_visual
+    if target == "gold":
+        return gold_visual
+    return pred_visual or gold_visual
+
+
+def build_clause_ids(raw_tokens: Sequence[str]) -> List[int]:
+    clause_ids: List[int] = []
+    clause_idx = 0
+    for tok in raw_tokens:
+        clause_ids.append(clause_idx)
+        if tok in {",", ";", ":"}:
+            clause_idx += 1
+    return clause_ids
+
+
+def select_attribution_augmented_indices(
+    query: str,
+    token_rows: Sequence[Dict[str, Any]],
+    token_scores_by_method: Dict[str, Dict[str, float]],
+    target_visual: bool,
+    max_tokens: int,
+) -> List[int]:
+    if not target_visual or max_tokens <= 0:
+        return []
+
+    raw_tokens = query_word_tokens(query)
+    clause_ids = build_clause_ids(raw_tokens)
+    strict_visual_indices = [int(row["index"]) for row in token_rows if row.get("label") == POS_LABEL_NAME]
+    anchor_clauses = {clause_ids[idx] for idx in strict_visual_indices if 0 <= idx < len(clause_ids)}
+
+    candidates: List[Dict[str, Any]] = []
+    for row in token_rows:
+        idx = int(row["index"])
+        norm = str(row.get("norm", ""))
+        if not row.get("important"):
+            continue
+        if row.get("label") == POS_LABEL_NAME:
+            continue
+        if not norm or norm in DEFAULT_ATTRIBUTION_FALLBACK_BLOCKLIST:
+            continue
+        method_scores = {
+            method: float(scores.get(norm, 0.0))
+            for method, scores in token_scores_by_method.items()
+            if float(scores.get(norm, 0.0)) > 0.0
+        }
+        if not method_scores:
+            continue
+        candidates.append(
+            {
+                "index": idx,
+                "max_score": max(method_scores.values()),
+                "method_scores": method_scores,
+                "same_clause_anchor": bool(anchor_clauses) and idx < len(clause_ids) and clause_ids[idx] in anchor_clauses,
+            }
+        )
+
+    if not candidates:
+        return []
+
+    pool = [c for c in candidates if c["same_clause_anchor"]] or candidates
+    selected: List[int] = []
+    selected_set: Set[int] = set()
+
+    for method in token_scores_by_method:
+        method_pool = [c for c in pool if method in c["method_scores"] and c["index"] not in selected_set]
+        if not method_pool:
+            continue
+        method_pool.sort(key=lambda c: (-c["method_scores"][method], -c["max_score"], c["index"]))
+        chosen = method_pool[0]
+        selected.append(chosen["index"])
+        selected_set.add(chosen["index"])
+        if len(selected) >= max_tokens:
+            return sorted(selected)
+
+    remaining = [c for c in pool if c["index"] not in selected_set]
+    remaining.sort(key=lambda c: (not c["same_clause_anchor"], -c["max_score"], c["index"]))
+    for cand in remaining:
+        selected.append(cand["index"])
+        selected_set.add(cand["index"])
+        if len(selected) >= max_tokens:
+            break
+
+    return sorted(selected)
 
 
 def normalize_phrase(
@@ -422,7 +609,7 @@ def classify_phrases_binary(
     visual_count = 0
     non_visual_count = 0
     for row in phrase_rows:
-        hits = [tok for tok in row["norm_tokens"] if tok in visual_lexicon]
+        hits = [tok for tok in row["norm_tokens"] if visual_lexicon_hit(tok, visual_lexicon)]
         label = POS_LABEL_NAME if hits else NEG_LABEL_NAME
         out_row = {
             "label": label,
@@ -488,6 +675,13 @@ def main() -> None:
                 stopwords=stopwords,
                 artifact_tokens=artifact_tokens,
             )
+            token_scores_by_method = collect_method_token_scores(
+                row=row,
+                methods=methods,
+                min_token_len=args.min_token_len,
+                stopwords=stopwords,
+                artifact_tokens=artifact_tokens,
+            )
             influential = build_influential_set(
                 tokens_by_method=tokens_by_method,
                 require_overlap=bool(args.require_method_overlap),
@@ -497,10 +691,28 @@ def main() -> None:
                 influential=influential,
                 visual_lexicon=visual_lexicon,
             )
+            target_visual = row_is_target_visual(row=row, target=args.augment_target)
+            attribution_augmented_indices = select_attribution_augmented_indices(
+                query=query,
+                token_rows=token_rows,
+                token_scores_by_method=token_scores_by_method,
+                target_visual=bool(args.augment_visual_tokens_from_attribution) and target_visual,
+                max_tokens=int(args.augment_max_tokens),
+            )
+            visual_token_indices_augmented = sorted(set(visual_token_indices) | set(attribution_augmented_indices))
+            visual_token_indices_augmented_set = set(visual_token_indices_augmented)
             phrase_rows, visual_phrase_count, non_visual_phrase_count = classify_phrases_binary(
                 phrase_rows=phrases_by_qid.get(qid, []),
                 visual_lexicon=visual_lexicon,
             )
+            for token_row in token_rows:
+                idx = int(token_row["index"])
+                token_row["augmented_label"] = (
+                    POS_LABEL_NAME if idx in visual_token_indices_augmented_set else NEG_LABEL_NAME
+                )
+                token_row["augmented_reasons"] = list(token_row.get("reasons", []))
+                if idx in attribution_augmented_indices and "attribution_fallback" not in token_row["augmented_reasons"]:
+                    token_row["augmented_reasons"].append("attribution_fallback")
 
             out_row = {
                 "query_id": qid,
@@ -519,6 +731,11 @@ def main() -> None:
                 "non_visual_token_indices": non_visual_token_indices,
                 "visual_token_count": len(visual_token_indices),
                 "non_visual_token_count": len(non_visual_token_indices),
+                "augment_visual_tokens_from_attribution": bool(args.augment_visual_tokens_from_attribution),
+                "augment_target": str(args.augment_target),
+                "attribution_augmented_token_indices": attribution_augmented_indices,
+                "visual_token_indices_augmented": visual_token_indices_augmented,
+                "visual_token_count_augmented": len(visual_token_indices_augmented),
                 "phrase_labels": phrase_rows,
                 "visual_phrase_count": visual_phrase_count,
                 "non_visual_phrase_count": non_visual_phrase_count,
