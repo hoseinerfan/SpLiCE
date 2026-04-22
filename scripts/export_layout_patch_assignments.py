@@ -49,6 +49,11 @@ def parse_args() -> argparse.Namespace:
         help="Combined JSON output path.",
     )
     p.add_argument(
+        "--skip-missing",
+        action="store_true",
+        help="Skip docs with missing layout runs instead of failing the whole export.",
+    )
+    p.add_argument(
         "--image-token-start",
         type=int,
         default=0,
@@ -216,14 +221,20 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     docs: Dict[str, Any] = {}
+    skipped: Dict[str, str] = {}
     for doc_id in doc_ids:
-        docs[doc_id] = export_doc(
-            output_root=output_root,
-            doc_id=doc_id,
-            run_tag=args.run_tag,
-            image_token_start=int(args.image_token_start),
-            image_token_count=int(args.image_token_count),
-        )
+        try:
+            docs[doc_id] = export_doc(
+                output_root=output_root,
+                doc_id=doc_id,
+                run_tag=args.run_tag,
+                image_token_start=int(args.image_token_start),
+                image_token_count=int(args.image_token_count),
+            )
+        except FileNotFoundError as exc:
+            if not args.skip_missing:
+                raise
+            skipped[doc_id] = str(exc)
 
     out = {
         "format": "layout_patch_assignments_v1",
@@ -237,7 +248,8 @@ def main() -> None:
 
     print(f"Wrote: {out_path}")
     print(f"docs: {len(docs)}")
-    for doc_id in doc_ids:
+    print(f"skipped_docs: {len(skipped)}")
+    for doc_id in docs:
         rec = docs[doc_id]
         print(
             f"{doc_id}: pages={rec['page_count']} "
@@ -246,6 +258,10 @@ def main() -> None:
             f"image={rec['counts']['image']} "
             f"unassigned={rec['counts']['unassigned']}"
         )
+    if skipped:
+        print("Skipped docs:")
+        for doc_id, reason in skipped.items():
+            print(f"{doc_id}: {reason}")
 
 
 if __name__ == "__main__":
