@@ -183,6 +183,7 @@ python scripts/export_layout_patch_assignments.py \
   --doc-ids-file "${BATCH_FILE}" \
   --output-root "${OUTPUT_ROOT}" \
   --run-tag latest \
+  --skip-missing \
   --output-json "${OUTPUT_ROOT}/layout_patch_assignments_${BATCH_NAME}.json"
 
 python - <<PY
