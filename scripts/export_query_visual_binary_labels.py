@@ -90,6 +90,37 @@ DEFAULT_ATTRIBUTION_FALLBACK_BLOCKLIST = {
     "here",
 }
 
+DEFAULT_PHRASE_AUGMENT_BLOCKLIST = DEFAULT_ATTRIBUTION_FALLBACK_BLOCKLIST | {
+    "over",
+    "under",
+    "feature",
+    "features",
+    "featuring",
+    "showing",
+    "shown",
+    "person",
+    "people",
+    "man",
+    "woman",
+    "boy",
+    "girl",
+    "base",
+    "top",
+    "bottom",
+    "left",
+    "right",
+    "middle",
+    "side",
+    "front",
+    "back",
+    "got",
+    "giving",
+    "thing",
+    "race",
+    "artist",
+    "artists",
+}
+
 DEFAULT_VISUAL_LEXICON = {
     "logo",
     "poster",
@@ -467,6 +498,7 @@ def select_attribution_augmented_indices(
         candidates.append(
             {
                 "index": idx,
+                "norm": norm,
                 "max_score": max(method_scores.values()),
                 "method_scores": method_scores,
                 "same_clause_anchor": bool(anchor_clauses) and idx < len(clause_ids) and clause_ids[idx] in anchor_clauses,
@@ -477,19 +509,20 @@ def select_attribution_augmented_indices(
     if not candidates:
         return []
 
-    if restrict_to_visual_phrases and visual_phrase_token_index_set:
-        phrase_pool = [c for c in candidates if c["in_visual_phrase"]]
-        if phrase_pool:
-            if anchor_clauses:
-                pool = [c for c in phrase_pool if c["same_clause_anchor"]] or phrase_pool
-            else:
-                pool = phrase_pool
-        elif anchor_clauses:
-            pool = [c for c in candidates if c["same_clause_anchor"]]
-            if not pool:
-                return []
+    if restrict_to_visual_phrases:
+        if not visual_phrase_token_index_set:
+            return []
+        phrase_pool = [
+            c
+            for c in candidates
+            if c["in_visual_phrase"] and c["norm"] not in DEFAULT_PHRASE_AUGMENT_BLOCKLIST
+        ]
+        if not phrase_pool:
+            return []
+        if anchor_clauses:
+            pool = [c for c in phrase_pool if c["same_clause_anchor"]] or phrase_pool
         else:
-            pool = candidates
+            pool = phrase_pool
     elif anchor_clauses:
         pool = [c for c in candidates if c["same_clause_anchor"]]
         if not pool:
