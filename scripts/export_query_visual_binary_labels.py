@@ -201,6 +201,15 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Max number of additional attribution-driven visual tokens to surface per query.",
     )
+    parser.add_argument(
+        "--augment-restrict-to-visual-phrases",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, when visual phrases exist for a query, attribution fallback prefers "
+            "tokens that fall inside those visual phrase spans."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -402,12 +411,32 @@ def build_clause_ids(raw_tokens: Sequence[str]) -> List[int]:
     return clause_ids
 
 
+def token_surface_equal(left: str, right: str) -> bool:
+    return str(left).casefold() == str(right).casefold()
+
+
+def find_raw_phrase_token_indices(query_tokens: Sequence[str], raw_phrase: str) -> List[int]:
+    phrase_tokens = query_word_tokens(raw_phrase)
+    if not phrase_tokens or len(phrase_tokens) > len(query_tokens):
+        return []
+
+    matched: Set[int] = set()
+    width = len(phrase_tokens)
+    for start in range(len(query_tokens) - width + 1):
+        window = query_tokens[start : start + width]
+        if all(token_surface_equal(a, b) for a, b in zip(window, phrase_tokens)):
+            matched.update(range(start, start + width))
+    return sorted(matched)
+
+
 def select_attribution_augmented_indices(
     query: str,
     token_rows: Sequence[Dict[str, Any]],
     token_scores_by_method: Dict[str, Dict[str, float]],
     target_visual: bool,
     max_tokens: int,
+    visual_phrase_token_indices: Optional[Sequence[int]] = None,
+    restrict_to_visual_phrases: bool = False,
 ) -> List[int]:
     if not target_visual or max_tokens <= 0:
         return []
@@ -416,6 +445,7 @@ def select_attribution_augmented_indices(
     clause_ids = build_clause_ids(raw_tokens)
     strict_visual_indices = [int(row["index"]) for row in token_rows if row.get("label") == POS_LABEL_NAME]
     anchor_clauses = {clause_ids[idx] for idx in strict_visual_indices if 0 <= idx < len(clause_ids)}
+    visual_phrase_token_index_set = {int(idx) for idx in (visual_phrase_token_indices or [])}
 
     candidates: List[Dict[str, Any]] = []
     for row in token_rows:
@@ -440,13 +470,27 @@ def select_attribution_augmented_indices(
                 "max_score": max(method_scores.values()),
                 "method_scores": method_scores,
                 "same_clause_anchor": bool(anchor_clauses) and idx < len(clause_ids) and clause_ids[idx] in anchor_clauses,
+                "in_visual_phrase": idx in visual_phrase_token_index_set,
             }
         )
 
     if not candidates:
         return []
 
-    if anchor_clauses:
+    if restrict_to_visual_phrases and visual_phrase_token_index_set:
+        phrase_pool = [c for c in candidates if c["in_visual_phrase"]]
+        if phrase_pool:
+            if anchor_clauses:
+                pool = [c for c in phrase_pool if c["same_clause_anchor"]] or phrase_pool
+            else:
+                pool = phrase_pool
+        elif anchor_clauses:
+            pool = [c for c in candidates if c["same_clause_anchor"]]
+            if not pool:
+                return []
+        else:
+            pool = candidates
+    elif anchor_clauses:
         pool = [c for c in candidates if c["same_clause_anchor"]]
         if not pool:
             return []
@@ -467,7 +511,14 @@ def select_attribution_augmented_indices(
             return sorted(selected)
 
     remaining = [c for c in pool if c["index"] not in selected_set]
-    remaining.sort(key=lambda c: (not c["same_clause_anchor"], -c["max_score"], c["index"]))
+    remaining.sort(
+        key=lambda c: (
+            not c["in_visual_phrase"],
+            not c["same_clause_anchor"],
+            -c["max_score"],
+            c["index"],
+        )
+    )
     for cand in remaining:
         selected.append(cand["index"])
         selected_set.add(cand["index"])
@@ -607,19 +658,25 @@ def merge_phrase_sources(
 
 
 def classify_phrases_binary(
+    query: str,
     phrase_rows: Sequence[Dict[str, Any]],
     visual_lexicon: Set[str],
 ) -> Tuple[List[Dict[str, Any]], int, int]:
     out: List[Dict[str, Any]] = []
     visual_count = 0
     non_visual_count = 0
+    query_tokens = query_word_tokens(query)
     for row in phrase_rows:
         hits = [tok for tok in row["norm_tokens"] if visual_lexicon_hit(tok, visual_lexicon)]
         label = POS_LABEL_NAME if hits else NEG_LABEL_NAME
+        matched_token_indices: Set[int] = set()
+        for raw_phrase in row.get("raw_examples", []):
+            matched_token_indices.update(find_raw_phrase_token_indices(query_tokens, str(raw_phrase)))
         out_row = {
             "label": label,
             "important": True,
             "visual_lexicon_hits": hits,
+            "matched_token_indices": sorted(matched_token_indices),
             **row,
         }
         out.append(out_row)
@@ -696,6 +753,19 @@ def main() -> None:
                 influential=influential,
                 visual_lexicon=visual_lexicon,
             )
+            phrase_rows, visual_phrase_count, non_visual_phrase_count = classify_phrases_binary(
+                query=query,
+                phrase_rows=phrases_by_qid.get(qid, []),
+                visual_lexicon=visual_lexicon,
+            )
+            visual_phrase_token_indices = sorted(
+                {
+                    int(idx)
+                    for phrase_row in phrase_rows
+                    if phrase_row.get("label") == POS_LABEL_NAME
+                    for idx in phrase_row.get("matched_token_indices", [])
+                }
+            )
             target_visual = row_is_target_visual(row=row, target=args.augment_target)
             attribution_augmented_indices = select_attribution_augmented_indices(
                 query=query,
@@ -703,13 +773,11 @@ def main() -> None:
                 token_scores_by_method=token_scores_by_method,
                 target_visual=bool(args.augment_visual_tokens_from_attribution) and target_visual,
                 max_tokens=int(args.augment_max_tokens),
+                visual_phrase_token_indices=visual_phrase_token_indices,
+                restrict_to_visual_phrases=bool(args.augment_restrict_to_visual_phrases),
             )
             visual_token_indices_augmented = sorted(set(visual_token_indices) | set(attribution_augmented_indices))
             visual_token_indices_augmented_set = set(visual_token_indices_augmented)
-            phrase_rows, visual_phrase_count, non_visual_phrase_count = classify_phrases_binary(
-                phrase_rows=phrases_by_qid.get(qid, []),
-                visual_lexicon=visual_lexicon,
-            )
             for token_row in token_rows:
                 idx = int(token_row["index"])
                 token_row["augmented_label"] = (
@@ -738,10 +806,12 @@ def main() -> None:
                 "non_visual_token_count": len(non_visual_token_indices),
                 "augment_visual_tokens_from_attribution": bool(args.augment_visual_tokens_from_attribution),
                 "augment_target": str(args.augment_target),
+                "augment_restrict_to_visual_phrases": bool(args.augment_restrict_to_visual_phrases),
                 "attribution_augmented_token_indices": attribution_augmented_indices,
                 "visual_token_indices_augmented": visual_token_indices_augmented,
                 "visual_token_count_augmented": len(visual_token_indices_augmented),
                 "phrase_labels": phrase_rows,
+                "visual_phrase_token_indices": visual_phrase_token_indices,
                 "visual_phrase_count": visual_phrase_count,
                 "non_visual_phrase_count": non_visual_phrase_count,
             }
