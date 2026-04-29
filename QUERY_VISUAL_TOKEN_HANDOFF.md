@@ -48,6 +48,38 @@ Important nuance:
 - if another chat needs the most likely strict lexicon-expanded export to inspect directly, start with:
   - `/mmfs1/scratch/jacks.local/aerfanshekooh/custom/outputs/visual_needed_binary/deberta_v3_large_seed42/export/dev_query_visual_binary_labels_union_relaxed_v6_fulltrainlex_v2.jsonl`
 
+## `union_relaxed_v2` provenance
+
+The following parts of `union_relaxed_v2` were recovered exactly from the saved JSONL metadata and later cluster inspection:
+
+- attribution file:
+  - `/mmfs1/scratch/jacks.local/aerfanshekooh/custom/outputs/visual_needed_binary/deberta_v3_large_seed42/attribution/dev_attr_visual_needed.jsonl`
+- context files:
+  - `/mmfs1/scratch/jacks.local/aerfanshekooh/custom/outputs/visual_needed_binary/deberta_v3_large_seed42/context/context_ig_visual_needed.json`
+  - `/mmfs1/scratch/jacks.local/aerfanshekooh/custom/outputs/visual_needed_binary/deberta_v3_large_seed42/context/context_occ_visual_needed.json`
+- methods used:
+  - `ig`, `occlusion`
+- `require_method_overlap = False`
+- `require_phrase_source_overlap = False`
+
+What is not serialized in the output:
+
+- the exact runtime visual-lexicon path or contents
+
+However, the cluster evidence now strongly constrains the lexicon interpretation:
+
+- `union_relaxed_v2` was created on `2026-04-20`
+- the explicitly named `subsetlex` variants were created on `2026-04-22`
+- the explicitly named `fulltrainlex` variants were created on `2026-04-23`
+- the observed LGBT example rules out later lexicons that contain `lgbt` as a visual term, because `lgbt` was in `important_token_overlap` but was not labeled visual
+- a later probe test over discriminating tokens returned `matches = 0`, which is most consistent with the conservative built-in exporter default rather than the larger older 321-token external lexicon family
+
+Best current conclusion:
+
+- the exact runtime lexicon path for `union_relaxed_v2` was not preserved
+- behaviorally, `union_relaxed_v2` matches the exporter's conservative built-in default visual lexicon
+- it should not be described as one of the later `subsetlex`, `fulltrainlex`, or phrase-augmentation variants
+
 ## Core code pointers
 
 Primary exporter:
@@ -63,6 +95,40 @@ Useful related scripts:
 - [scripts/export_query_token_visual_labels.py](/Users/hoseinerfan/Desktop/SPLICE/SpLiCE/scripts/export_query_token_visual_labels.py)
 - [scripts/export_visual_needed_merged_real.py](/Users/hoseinerfan/Desktop/SPLICE/SpLiCE/scripts/export_visual_needed_merged_real.py)
 - [scripts/export_visual_needed_merged_recall.py](/Users/hoseinerfan/Desktop/SPLICE/SpLiCE/scripts/export_visual_needed_merged_recall.py)
+
+## Built-in default visual lexicon
+
+The exact built-in default lexicon in the exporter is:
+
+- `logo`
+- `poster`
+- `image`
+- `photo`
+- `picture`
+- `face`
+- `hair`
+- `beard`
+- `mustache`
+- `glasses`
+- `eyeglasses`
+- `wear`
+- `wearing`
+- `wears`
+- `holding`
+- `holds`
+- `color`
+- `colour`
+- `shape`
+- `symbol`
+- `flag`
+- `jersey`
+- `bald`
+- `sideburns`
+- `visual`
+
+Source:
+
+- [scripts/export_query_visual_binary_labels.py:124](/Users/hoseinerfan/Desktop/SPLICE/SpLiCE/scripts/export_query_visual_binary_labels.py:124)
 
 ## Strict query-token pseudo-algorithm
 
@@ -128,7 +194,7 @@ This part is based on:
 Input:
   - attribution JSONL from the training split
   - attribution methods (IG, Occlusion)
-  - seed visual lexicon
+  - initial curated visual lexicon
   - visual vs non-visual query labels
 
 Output:
@@ -177,6 +243,7 @@ Important nuance:
 
 - this is contrastive mining, not just frequency mining
 - a token is kept only if it appears sufficiently often in visual queries and is not too common in non-visual queries
+- in this note, "initial curated visual lexicon" means the starting/base lexicon before train-mined extension terms were added; for `union_relaxed_v2`, the recovered evidence is most consistent with the built-in default list recorded above
 
 ## Evaluation protocol
 
